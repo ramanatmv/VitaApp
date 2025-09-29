@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+requests
+langchain
+pydantic
+texttable
+langchain-google-genai
+langgraph
+python-dotenv
+langchain-core
+pandas
+schedule
+Flask
+google-generativeai

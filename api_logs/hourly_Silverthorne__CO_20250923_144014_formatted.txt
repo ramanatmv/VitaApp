@@ -1,0 +1,14 @@
+=== API CALL LOG ===
+City: Silverthorne, CO
+API Type: hourly
+Timestamp: 2025-09-23 14:40:14
+Current Hour: 14
+===================
+
+FORMATTED OUTPUT:
+
+
+=== RAW PERIODS COUNT ===
+Total periods received: 156
+First period: {'number': 1, 'name': '', 'startTime': '2025-09-23T12:00:00-06:00', 'endTime': '2025-09-23T13:00:00-06:00', 'isDaytime': True, 'temperature': 45, 'temperatureUnit': 'F', 'temperatureTrend': '', 'probabilityOfPrecipitation': {'unitCode': 'wmoUnit:percent', 'value': 90}, 'dewpoint': {'unitCode': 'wmoUnit:degC', 'value': 3.3333333333333335}, 'relativeHumidity': {'unitCode': 'wmoUnit:percent', 'value': 76}, 'windSpeed': '6 mph', 'windDirection': 'NNW', 'icon': 'https://api.weather.gov/icons/land/day/tsra,90?size=small', 'shortForecast': 'Light Rain', 'detailedForecast': ''}
+Last period: {'number': 156, 'name': '', 'startTime': '2025-09-29T23:00:00-06:00', 'endTime': '2025-09-30T00:00:00-06:00', 'isDaytime': False, 'temperature': 45, 'temperatureUnit': 'F', 'temperatureTrend': '', 'probabilityOfPrecipitation': {'unitCode': 'wmoUnit:percent', 'value': 18}, 'dewpoint': {'unitCode': 'wmoUnit:degC', 'value': 2.7777777777777777}, 'relativeHumidity': {'unitCode': 'wmoUnit:percent', 'value': 73}, 'windSpeed': '3 mph', 'windDirection': 'S', 'icon': 'https://api.weather.gov/icons/land/night/rain_showers,20?size=small', 'shortForecast': 'Slight Chance Rain Showers', 'detailedForecast': ''}

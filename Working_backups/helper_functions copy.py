@@ -1,0 +1,4150 @@
+# -*- coding: utf-8 -*-
+import os
+import requests
+import json
+import logging
+import re
+from datetime import datetime, timedelta
+from typing import TypedDict, Annotated, Optional, Dict, List
+from langchain_core.tools import tool
+from langchain_core.messages import BaseMessage
+import operator
+from dotenv import load_dotenv
+import schedule
+import time
+import threading
+import smtplib
+import ssl
+from email.message import EmailMessage
+from flask import request
+
+# Import our custom modules
+from enhanced_rwi import calculate_rwi
+from llm_prompts import format_runner_profile_prompt, get_llm_run_plan_summary
+from email_formatter import create_email_html
+
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+
+# --- Email Function ---
+
+# Add these functions to your helper_functions.py file
+
+def generate_mobile_cards_for_email(card_data: dict, city: str) -> str:
+    """Generate email HTML that exactly replicates the mobile cards interface."""
+    
+    # Define the exact card order as it appears in mobile
+    card_order = ['summary']
+    
+    if card_data.get('profile', {}).get('has_profile'):
+        card_order.append('profile')
+    
+    if needs_nutrition_card_for_email(card_data):
+        card_order.append('nutrition')
+    
+    if card_data.get('today') and len(card_data['today']) > 0:
+        card_order.extend(['today', 'today_detail'])
+    
+    if card_data.get('tomorrow') and len(card_data['tomorrow']) > 0:
+        card_order.extend(['tomorrow', 'tomorrow_detail'])
+    
+    card_order.append('details')
+    
+    email_html_parts = []
+    
+    # Generate each card exactly as it appears in mobile
+    for i, card_type in enumerate(card_order):
+        card_number = i + 1
+        total_cards = len(card_order)
+        
+        # Card header with navigation info (like mobile)
+        card_header = f"""
+        <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 15px; margin: 20px 0 0 0; border-radius: 10px 10px 0 0;">
+            <h2 style="margin: 0; font-size: 18px; display: flex; justify-content: space-between; align-items: center;">
+                <span>{get_card_title(card_type)}</span>
+                <span style="font-size: 14px; opacity: 0.8;">Card {card_number} of {total_cards}</span>
+            </h2>
+        </div>
+        """
+        
+        # Card content container
+        card_content_start = f"""
+        <div style="background: white; border: 1px solid #ddd; border-top: none; border-radius: 0 0 10px 10px; padding: 20px; margin-bottom: 25px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);">
+        """
+        
+        # Generate the specific card content
+        if card_type == 'summary':
+            card_content = generate_summary_card_for_email(card_data)
+        elif card_type == 'profile':
+            card_content = generate_profile_card_for_email(card_data)
+        elif card_type == 'nutrition':
+            card_content = generate_nutrition_card_for_email(card_data)
+        elif card_type == 'today':
+            card_content = generate_today_card_for_email(card_data)
+        elif card_type == 'today_detail':
+            card_content = generate_today_detail_card_for_email(card_data)
+        elif card_type == 'tomorrow':
+            card_content = generate_tomorrow_card_for_email(card_data)
+        elif card_type == 'tomorrow_detail':
+            card_content = generate_tomorrow_detail_card_for_email(card_data)
+        elif card_type == 'details':
+            card_content = generate_details_card_for_email(card_data)
+        else:
+            card_content = f"<p>Card content for {card_type}</p>"
+        
+        card_content_end = "</div>"
+        
+        # Combine all parts
+        full_card = card_header + card_content_start + card_content + card_content_end
+        email_html_parts.append(full_card)
+    
+    return ''.join(email_html_parts)
+
+def needs_nutrition_card_for_email(card_data: dict) -> bool:
+    """Check if nutrition card should be included (same logic as mobile)."""
+    profile = card_data.get('profile', {})
+    return (profile and profile.get('has_profile') and 
+            (profile.get('nutrition') or profile.get('strength_training') or profile.get('mindfulness')))
+
+def get_card_title(card_type: str) -> str:
+    """Get card titles exactly as they appear in mobile."""
+    titles = {
+        'summary': '📋 Today\'s Plan Summary',
+        'profile': '🏃‍♀️🏃‍♂️ Your Running Plan',
+        'nutrition': '🥗 Nutrition & Fitness',
+        'today': '☀️ Today\'s Forecast',
+        'today_detail': '📅 Today\'s Detailed Forecast',
+        'tomorrow': '🌄 Tomorrow\'s Forecast',
+        'tomorrow_detail': '📆 Tomorrow\'s Detailed Forecast',
+        'details': '⚙️ Technical Details'
+    }
+    return titles.get(card_type, card_type)
+
+def get_score_description_for_email(score):
+    """Get score description for email formatting."""
+    if score is None or score == 'N/A':
+        return 'Unknown'
+    
+    score = float(score)
+    if score >= 4.5:
+        return "Perfect"
+    elif score >= 4.0:
+        return "Excellent" 
+    elif score >= 3.5:
+        return "Great"
+    elif score >= 3.0:
+        return "Good"
+    elif score >= 2.0:
+        return "Fair"
+    else:
+        return "Poor"
+
+def generate_summary_card_for_email(card_data: dict) -> str:
+    """Generate summary card exactly as it appears in mobile."""
+    summary = card_data.get('summary', {})
+    days_plan = card_data.get('days_plan', {})
+    calories = summary.get('estimated_calories')
+    
+    # Extract condensed plan exactly like mobile does
+    condensed_plan = ''
+    if days_plan and days_plan.get('content'):
+        lines = days_plan['content'].split('\n')
+        lines = [line.strip() for line in lines if line.strip()]
+        
+        run_line = strength_line = nutrition_line = mindfulness_line = ''
+        
+        for line in lines:
+            trimmed = line.strip()
+            if trimmed.lower().startswith('- run:') or trimmed.lower().startswith('run:'):
+                run_line = re.sub(r'^-?\s*run:\s*', '', trimmed, flags=re.IGNORECASE).strip()
+            elif trimmed.lower().startswith('- strength:') or trimmed.lower().startswith('strength:'):
+                strength_line = re.sub(r'^-?\s*strength:\s*', '', trimmed, flags=re.IGNORECASE).strip()
+            elif trimmed.lower().startswith('- nutrition:') or trimmed.lower().startswith('nutrition:'):
+                nutrition_line = re.sub(r'^-?\s*nutrition:\s*', '', trimmed, flags=re.IGNORECASE).strip()
+            elif trimmed.lower().startswith('- mindfulness:') or trimmed.lower().startswith('mindfulness:'):
+                mindfulness_line = re.sub(r'^-?\s*mindfulness:\s*', '', trimmed, flags=re.IGNORECASE).strip()
+        
+        plan_components = []
+        if run_line:
+            plan_components.append(f'<p style="margin: 8px 0; line-height: 1.5; font-size: 13px;"><strong>Run:</strong> {run_line}</p>')
+        if strength_line:
+            plan_components.append(f'<p style="margin: 8px 0; line-height: 1.5; font-size: 13px;"><strong>Strength/Mobility:</strong> {strength_line}</p>')
+        if nutrition_line:
+            plan_components.append(f'<p style="margin: 8px 0; line-height: 1.5; font-size: 13px;"><strong>Nutrition:</strong> {nutrition_line}</p>')
+        if mindfulness_line:
+            plan_components.append(f'<p style="margin: 8px 0; line-height: 1.5; font-size: 13px;"><strong>Mindfulness:</strong> {mindfulness_line}</p>')
+        
+        condensed_plan = ''.join(plan_components)
+    
+    # Calorie section
+    calorie_section = ''
+    if calories:
+        env_adjustment = f'<p style="font-size: 10px; margin: 4px 0; color: #C92A2A;">+{calories["environmental_adjustment"]}% heat/humidity adjustment</p>' if calories.get("environmental_adjustment", 0) > 0 else ''
+        
+        calorie_section = f'''
+        <div style="background: linear-gradient(135deg, #FFE5E5, #FFD6D6); border: 2px solid #FF6B6B; margin-top: 10px; padding: 12px; border-radius: 8px;">
+            <h3 style="font-size: 14px; margin-bottom: 6px; color: #C92A2A;">Target Calories Burn</h3>
+            <p style="font-size: 20px; font-weight: bold; color: #C92A2A; margin: 8px 0;">{calories["estimated_calories"]} cal</p>
+            <p style="font-size: 11px; margin: 4px 0;">Intensity: {calories["intensity_level"]} (MET: {calories["met_value"]})</p>
+            {env_adjustment}
+            <p style="font-size: 10px; margin: 4px 0; color: #666;">Dewpoint impact: {calories["dewpoint_impact"]}</p>
+        </div>
+        '''
+    
+    # Best weather section
+    best_weather = ''
+    if summary.get('best_time'):
+        best = summary['best_time']
+        best_weather = f'''
+        <div style="background: linear-gradient(135deg, #E8F5E9, #C8E6C9); border: 1px solid #4CAF50; border-radius: 8px; padding: 12px; margin: 10px 0;">
+            <h3 style="font-size: 14px; margin-top: 0; margin-bottom: 6px; color: #2E7D32;">Best Weather</h3>
+            <p style="font-size: 12px;"><strong>Best Time:</strong> {best.get('day', 'N/A')} {best.get('time', 'N/A')}</p>
+            <p style="font-size: 12px;"><strong>Score:</strong> {best.get('score', 'N/A')}/5.0 - {get_score_description_for_email(best.get('score'))}</p>
+            <p style="font-size: 12px;"><strong>Why:</strong> {best.get('reason', 'Optimal running conditions')}</p>
+        </div>
+        '''
+    
+    # Second best section
+    second_best = ''
+    if summary.get('second_best_time'):
+        second = summary['second_best_time']
+        second_best = f'''
+        <div style="background: linear-gradient(135deg, #FFF8E1, #FFECB3); border: 1px solid #FF9800; margin-top: 10px; border-radius: 8px; padding: 12px;">
+            <h3 style="font-size: 14px; margin-bottom: 6px;">Second Best Weather</h3>
+            <p style="font-size: 12px;"><strong>Time:</strong> {second.get('day')} {second.get('time')}</p>
+            <p style="font-size: 12px;"><strong>Score:</strong> {second.get('score')}/5.0 - {get_score_description_for_email(second.get('score'))}</p>
+            <p style="font-size: 12px;"><strong>Why:</strong> {second.get('reason')}</p>
+        </div>
+        '''
+    
+    return f'''
+        <div style="background: linear-gradient(135deg, #E3F2FD, #BBDEFB); border: 2px solid #2196F3; padding: 20px; border-radius: 8px;">
+            <h3 style="font-size: 16px; margin-bottom: 12px; color: #1976D2;">Today's Plan</h3>
+            <div style="min-height: 120px;">
+                {condensed_plan or '<p style="font-size: 12px;">No plan details available</p>'}
+            </div>
+        </div>
+        {calorie_section}
+        {best_weather}
+        {second_best}
+    '''
+
+def generate_profile_card_for_email(card_data: dict) -> str:
+    """Generate profile card exactly as it appears in mobile."""
+    profile = card_data.get('profile', {})
+    
+    if not profile.get('has_profile'):
+        return '''
+        <div style="background: #f8f9fa; border-radius: 8px; padding: 12px; border: 1px solid #e0e0e0;">
+            <p>No runner profile information was provided. Fill out the profile section in the main form to see personalized training plans and recommendations.</p>
+        </div>
+        '''
+    
+    # Goal section
+    goal_section = f'''
+    <div style="background: linear-gradient(135deg, #E3F2FD, #BBDEFB); border: 2px solid #2196F3; margin-bottom: 15px; border-radius: 8px; padding: 15px;">
+        <h3 style="font-size: 15px; margin-bottom: 10px; color: #1976D2;">🌅🏃 Current Goal</h3>
+        <p style="font-size: 13px; margin-bottom: 4px;"><strong>Plan Type:</strong> {profile.get('plan', 'No plan selected')}</p>
+        <p style="font-size: 13px;"><strong>Week:</strong> {profile.get('week', 'Not specified')}</p>
+    </div>
+    '''
+    
+    # Weekly plans section
+    weekly_section = ''
+    if profile.get('all_weeks_plan'):
+        current_week = profile.get('current_week', 1)
+        total_weeks = profile.get('total_weeks', len(profile['all_weeks_plan']))
+        
+        weekly_section = f'''
+        <div style="border: 1px solid #e0e0e0; border-radius: 8px; padding: 10px; max-height: 400px; overflow-y: auto;">
+            <div style="text-align: center; padding: 5px 0; margin-bottom: 10px;">
+                <span style="font-weight: bold; color: #1976D2; font-size: 16px;">Week {current_week} of {total_weeks}</span>
+            </div>
+        '''
+        
+        for week_data in profile['all_weeks_plan']:
+            week_num = week_data['week_number']
+            is_current = week_data.get('is_current', False)
+            phase = week_data.get('phase', '')
+            
+            week_style = 'background: linear-gradient(135deg, #e3f2fd, #bbdefb); border: 2px solid #2196F3; box-shadow: 0 2px 8px rgba(33, 150, 243, 0.2);' if is_current else 'background: #f8f9fa; opacity: 0.8;'
+            
+            week_plans_html = ''
+            for day in week_data.get('weekly_plan', []):
+                day_class = ''
+                status_text = ''
+                if day.get('completed'):
+                    day_class = 'background: rgba(76, 175, 80, 0.1); border-color: #4CAF50;'
+                    status_text = 'Ã¢ÂÂ'
+                elif is_current and day.get('day') == 'Today':  # This would need proper day detection
+                    day_class = 'background: rgba(33, 150, 243, 0.1); border-color: #2196F3; font-weight: bold;'
+                    status_text = 'ð Today'
+                
+                week_plans_html += f'''
+                <div style="display: grid; grid-template-columns: 60px 1fr 50px; align-items: center; padding: 6px 10px; {day_class} border-radius: 6px; border: 1px solid #e0e0e0; gap: 8px; margin-bottom: 6px;">
+                    <span style="font-weight: bold; font-size: 11px; color: #666;">{day['day']}</span>
+                    <span style="font-size: 11px; line-height: 1.2;">{day['workout']}</span>
+                    <span style="font-size: 11px; text-align: center;">{status_text}</span>
+                </div>
+                '''
+            
+            weekly_section += f'''
+            <div style="margin-bottom: 20px; padding: 15px; border-radius: 8px; {week_style}">
+                <h4 style="color: #1976D2; font-size: 16px; margin-bottom: 10px;">â³ Week {week_num} - {phase}</h4>
+                <div>{week_plans_html}</div>
+            </div>
+            '''
+        
+        weekly_section += '</div>'
+    
+    return goal_section + weekly_section
+
+def generate_nutrition_card_for_email(card_data: dict) -> str:
+    """Generate nutrition card exactly as it appears in mobile."""
+    profile = card_data.get('profile', {})
+    content_parts = []
+    
+    # Nutrition section
+    if profile.get('nutrition'):
+        nutrition = profile['nutrition']
+        dietary_note = (
+    f'<p style="font-size: 11px; margin-top: 8px; padding: 6px; '
+    f'background: rgba(255,255,255,0.5); border-radius: 4px;">'
+    f'<strong>⚠️ Dietary notes:</strong> {profile.get("dietary_restrictions")}</p>'
+    if profile.get("dietary_restrictions")
+    else ""
+)
+
+        
+        content_parts.append(f'''
+        <div style="background: linear-gradient(135deg, rgba(232, 245, 233, 0.9), rgba(200, 230, 201, 0.8)); padding: 15px; border-radius: 8px; position: relative; border: 2px solid #4CAF50; margin-bottom: 15px;">
+            <div style="position: absolute; top: 8px; right: 12px; font-size: 35px; opacity: 0.8;">🌅🏃‍♂️</div>
+            <h3 style="margin: 0 0 10px 0; font-size: 14px; color: #2E7D32;">🏃‍♂️ Nutrition Focus</h3>
+            <p style="font-size: 12px;"><strong>Pre-run:</strong> {nutrition.get('pre_run', 'Not specified')}</p>
+            <p style="font-size: 12px;"><strong>During run:</strong> {nutrition.get('during', 'Not specified')}</p>
+            <p style="font-size: 12px;"><strong>Post-run:</strong> {nutrition.get('post_run', 'Not specified')}</p>
+            {dietary_note}
+        </div>
+        ''')
+    
+    # Strength training section
+    if profile.get('strength_training'):
+        strength = profile['strength_training']
+        content_parts.append(f'''
+        <div style="background: linear-gradient(135deg, rgba(255, 243, 224, 0.9), rgba(255, 224, 178, 0.8)); padding: 15px; border-radius: 8px; position: relative; border: 2px solid #FF9800; margin-bottom: 15px;">
+            <div style="position: absolute; top: 8px; right: 12px; font-size: 35px; opacity: 0.8;">🏋️‍♂️</div>
+            <h3 style="margin: 0 0 10px 0; font-size: 14px; color: #F57C00;">💪 Strength Training</h3>
+            <p style="font-size: 12px;"><strong>Schedule:</strong> {strength.get('schedule', 'Not specified')}</p>
+            <p style="font-size: 12px;"><strong>Focus:</strong> {strength.get('focus', 'Not specified')}</p>
+            <p style="font-size: 12px;"><strong>Exercises:</strong> {strength.get('exercises', 'Not specified')}</p>
+            <p style="font-size: 12px;"><strong>Duration:</strong> {strength.get('duration', 'Not specified')}</p>
+        </div>
+        ''')
+    
+    # Mindfulness section
+    if profile.get('mindfulness'):
+        mindfulness = profile['mindfulness']
+        content_parts.append(f'''
+        <div style="background: linear-gradient(135deg, rgba(243, 229, 245, 0.9), rgba(225, 190, 231, 0.8)); padding: 15px; border-radius: 8px; position: relative; border: 2px solid #9C27B0;">
+            <div style="position: absolute; top: 8px; right: 12px; font-size: 35px; opacity: 0.8;">🧘</div>
+            <h3 style="margin: 0 0 10px 0; font-size: 14px; color: #7B1FA2;">🪷 Mindfulness Plan</h3>
+            <p style="font-size: 12px;"><strong>Daily Practice:</strong> {mindfulness.get('practice', 'Not specified')}</p>
+            <p style="font-size: 12px;"><strong>Focus Areas:</strong> {mindfulness.get('focus', 'Not specified')}</p>
+            <p style="font-size: 12px;"><strong>Running Integration:</strong> {mindfulness.get('running', 'Not specified')}</p>
+            <p style="font-size: 12px;"><strong>Recovery:</strong> {mindfulness.get('recovery', 'Not specified')}</p>
+        </div>
+        ''')
+
+    
+    return ''.join(content_parts) if content_parts else '<p>No wellness components selected.</p>'
+
+def generate_today_card_for_email(card_data: dict) -> str:
+    """Generate today's forecast card exactly as in mobile."""
+    today_data = card_data.get('today', [])
+    
+    if not today_data:
+        return '<p>No forecast data available for today.</p>'
+    
+    hours_html = []
+    for hour in today_data:
+        hours_html.append(generate_colored_hour_card_for_email(hour))
+    
+    return ''.join(hours_html)
+
+def generate_colored_hour_card_for_email(hour):
+    """Generate a color-coded hour card for email display."""
+    score = hour.get('score', 0)
+    
+    # Determine color scheme based on score
+    if score >= 4.5:
+        bg_color = '#E8F5E9'
+        border_color = '#4CAF50'
+    elif score >= 4.0:
+        bg_color = '#F1F8E9'
+        border_color = '#8BC34A'
+    elif score >= 3.0:
+        bg_color = '#FFF3E0'
+        border_color = '#FF9800'
+    elif score >= 2.0:
+        bg_color = '#FFE0B2'
+        border_color = '#FF5722'
+    else:
+        bg_color = '#FFEBEE'
+        border_color = '#F44336'
+    
+    time = hour.get('time', 'N/A')
+    temp = hour.get('temp', 'N/A')
+    wind = hour.get('wind', 'N/A')
+    humidity = hour.get('humidity', 'N/A')
+    precip = hour.get('precip', 'N/A')
+    recommendation = hour.get('recommendation', 'No recommendation')
+    
+    return f"""
+    <div style="background: {bg_color}; border-left: 4px solid {border_color}; border-radius: 8px; padding: 12px; margin: 10px 0;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <strong style="font-size: 16px;">{time}</strong>
+            <span style="background: {border_color}; color: white; padding: 4px 12px; border-radius: 15px; font-weight: bold; font-size: 14px;">
+                {score}/5.0
+            </span>
+        </div>
+        <div style="margin: 8px 0; font-size: 14px; color: #555;">
+            <strong>{temp}°F</strong> • 💨 {wind}mph • 💧 {humidity}% • ☔ {precip}%
+        </div>
+        <div style="margin-top: 10px; padding: 8px; background: rgba(255,255,255,0.7); border-radius: 6px; font-size: 13px; font-style: italic;">
+            💡 {recommendation}
+        </div>
+    </div>
+"""
+
+
+def generate_tomorrow_card_for_email(card_data: dict) -> str:
+    """Generate tomorrow's forecast card exactly as in mobile."""
+    tomorrow_data = card_data.get('tomorrow', [])
+    
+    if not tomorrow_data:
+        return '<p>No forecast data available for tomorrow.</p>'
+    
+    hours_html = []
+    for hour in tomorrow_data:
+        hours_html.append(generate_colored_hour_card_for_email(hour))
+    
+    return ''.join(hours_html)
+
+def generate_detailed_hour_card_for_email(hour):
+    """Generate a detailed hour card for email display with full recommendations."""
+    score = hour.get('score', 0)
+    
+    # Determine color scheme based on score
+    if score >= 4.5:
+        bg_color = '#E8F5E9'
+        border_color = '#4CAF50'
+    elif score >= 4.0:
+        bg_color = '#F1F8E9'
+        border_color = '#8BC34A'
+    elif score >= 3.0:
+        bg_color = '#FFF3E0'
+        border_color = '#FF9800'
+    elif score >= 2.0:
+        bg_color = '#FFE0B2'
+        border_color = '#FF5722'
+    else:
+        bg_color = '#FFEBEE'
+        border_color = '#F44336'
+    
+    time = hour.get('time', 'N/A')
+    temp = hour.get('temp', 'N/A')
+    wind = hour.get('wind', 'N/A')
+    humidity = hour.get('humidity', 'N/A')
+    precip = hour.get('precip', 'N/A')
+    forecast = hour.get('forecast', 'N/A')
+    full_recommendation = hour.get('full_recommendation', hour.get('recommendation', 'No recommendation'))
+    heat_stress = hour.get('heat_stress', 'Unknown')
+    
+    return f"""
+    <div style="background: {bg_color}; border-left: 4px solid {border_color}; border-radius: 8px; padding: 15px; margin: 12px 0;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <strong style="font-size: 18px;">{time}</strong>
+            <span style="background: {border_color}; color: white; padding: 6px 14px; border-radius: 20px; font-weight: bold; font-size: 15px;">
+                {score}/5.0
+            </span>
+        </div>
+        
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 10px 0; font-size: 14px;">
+            <div><strong>🌡️ Temp:</strong> {temp}°F</div>
+            <div><strong>💨 Wind:</strong> {wind}mph</div>
+            <div><strong>💧 Humidity:</strong> {humidity}%</div>
+            <div><strong>☔ Precip:</strong> {precip}%</div>
+        </div>
+        
+        <div style="margin: 10px 0; padding: 10px; background: rgba(33, 150, 243, 0.1); border-left: 3px solid #2196F3; border-radius: 6px; font-size: 14px;">
+            <strong>⛅ Conditions:</strong> {forecast}
+        </div>
+        
+        <div style="margin-top: 12px; padding: 10px; background: rgba(255,255,255,0.7); border-radius: 6px; font-size: 14px; line-height: 1.5;">
+            <strong>💡 Full Recommendations:</strong><br>
+            {full_recommendation}
+        </div>
+        
+        <div style="margin-top: 10px; font-size: 12px; color: #666;">
+            <strong>🔥 Heat Stress Level:</strong> {heat_stress}
+        </div>
+    </div>
+"""
+
+
+def enhance_forecast_for_email(html_content: str) -> str:
+    """Enhance forecast HTML for better email display."""
+    import re
+    
+    # Ensure temperature displays are prominent
+    html_content = re.sub(
+        r'(\d+)°F',
+        r'<span style="color: #FF6B35; font-weight: bold; font-size: 16px;">\1°F</span>',
+        html_content
+    )
+    
+    # Enhance score displays
+    html_content = re.sub(
+        r'(\d+\.\d+)/5',
+        r'<span style="color: #4CAF50; font-weight: bold;">\1/5</span>',
+        html_content
+    )
+    
+    # Ensure proper styling for condition sections
+    html_content = re.sub(
+        r'<strong>⛅ Conditions:</strong>',
+        r'<strong style="color: #2196F3;">⛅ Conditions:</strong>',
+        html_content
+)
+
+# Enhance recommendation sections
+    html_content = re.sub(
+        r'<strong>💡 Recommendations:</strong>',
+        r'<strong style="color: #FF6600;">💡 Recommendations:</strong>',
+        html_content
+)
+
+    return html_content
+
+
+def generate_today_detail_card_for_email(card_data: dict) -> str:
+    """Generate today's detailed forecast exactly as in mobile."""
+    today_data = card_data.get('today', [])
+    
+    if not today_data:
+        return '<p>No forecast data available for today.</p>'
+    
+    content = '<p style="font-size: 12px; color: #666; margin-bottom: 15px;">Complete recommendations for each hour</p>'
+    
+    hours_html = []
+    for hour in today_data:
+        hours_html.append(generate_detailed_hour_card_for_email(hour))
+    
+    return content + ''.join(hours_html)
+
+def generate_tomorrow_detail_card_for_email(card_data: dict) -> str:
+    """Generate tomorrow's detailed forecast exactly as in mobile."""
+    tomorrow_data = card_data.get('tomorrow', [])
+    
+    if not tomorrow_data:
+        return '<p>No forecast data available for tomorrow.</p>'
+    
+    content = '<p style="font-size: 12px; color: #666; margin-bottom: 15px;">Complete recommendations for each hour</p>'
+    
+    hours_html = []
+    for hour in tomorrow_data:
+        hours_html.append(generate_detailed_hour_card_for_email(hour))
+    
+    return content + ''.join(hours_html)
+
+def generate_details_card_for_email(card_data: dict) -> str:
+    """Generate technical details card exactly as in mobile."""
+    details = card_data.get('details', {})
+    
+    sections = []
+    
+    # Heat stress section
+    heat_stress = details.get('heat_stress', {})
+    sections.append(f'''
+    <div style="background: #f8f9fa; border-radius: 8px; padding: 12px; margin-bottom: 12px; border: 1px solid #e0e0e0;">
+        <h3 style="color: #007bff; margin: 0 0 8px 0; font-size: 14px;">🌡️ Heat Stress Analysis</h3>
+        <p style="font-size: 12px; margin-bottom: 4px;"><strong>Peak Heat Index:</strong> {heat_stress.get('peak_heat_index', 'N/A')}</p>
+        <p style="font-size: 12px; margin-bottom: 4px;"><strong>Dewpoint Range:</strong> {heat_stress.get('dewpoint_range', 'N/A')}</p>
+        <p style="font-size: 12px; margin-bottom: 4px;"><strong>UV Index:</strong> {heat_stress.get('uv_index', 'N/A')}</p>
+    </div>
+    ''')
+    
+    # Wind patterns section
+    wind_patterns = details.get('wind_patterns', {})
+    sections.append(f'''
+    <div style="background: #f9fafb; border-left: 4px solid #2196F3; border-radius: 8px; padding: 12px; margin-bottom: 12px; border: 1px solid #e0e0e0;">
+        <h3 style="color: #007bff; margin: 0 0 8px 0; font-size: 14px;">🌬️ Wind Patterns</h3>
+        <p style="font-size: 12px; margin-bottom: 4px;"><strong>Morning:</strong> {wind_patterns.get('morning', 'N/A')}</p>
+        <p style="font-size: 12px; margin-bottom: 4px;"><strong>Afternoon:</strong> {wind_patterns.get('afternoon', 'N/A')}</p>
+        <p style="font-size: 12px; margin-bottom: 4px;"><strong>Direction:</strong> {wind_patterns.get('direction', 'N/A')}</p>
+    </div>
+    ''')
+    
+    # Precipitation section
+    precipitation = details.get('precipitation', {})
+    sections.append(f'''
+    <div style="background: #f9fafb; border-left: 4px solid #2196F3; border-radius: 8px; padding: 12px; margin-bottom: 12px; border: 1px solid #e0e0e0;">
+        <h3 style="color: #007bff; margin: 0 0 8px 0; font-size: 14px;">🌧️ Precipitation</h3>
+        <p style="font-size: 12px; margin-bottom: 4px;"><strong>Today:</strong> {precipitation.get('today', 'N/A')}</p>
+        <p style="font-size: 12px; margin-bottom: 4px;"><strong>Tomorrow:</strong> {precipitation.get('tomorrow', 'N/A')}</p>
+        <p style="font-size: 12px; margin-bottom: 4px;"><strong>Type:</strong> {precipitation.get('type', 'N/A')}</p>
+    </div>
+    ''')
+    
+    # Air quality section
+    air_quality = details.get('air_quality', {})
+    sections.append(f'''
+    <div style="background: #f9fafb; border-left: 4px solid #2196F3; border-radius: 8px; padding: 12px; margin-bottom: 12px; border: 1px solid #e0e0e0;">
+        <h3 style="color: #007bff; margin: 0 0 8px 0; font-size: 14px;">🌱 Air Quality</h3>
+        <p style="font-size: 12px; margin-bottom: 4px;"><strong>AQI:</strong> {air_quality.get('aqi', 'N/A')} ({air_quality.get('category', 'Unknown')})</p>
+        <p style="font-size: 12px; margin-bottom: 4px;"><strong>Restrictions:</strong> {air_quality.get('restrictions', 'No information available')}</p>
+    </div>
+    ''')
+    
+    return ''.join(sections)
+
+def generate_email_content_from_cards(card_data: dict, city: str) -> str:
+    """Generate email-friendly HTML content from mobile card data."""
+    html_parts = []
+    
+    # Summary Section
+    summary = card_data.get('summary', {})
+    if summary:
+        html_parts.append(f"""
+        <div style="background: #e3f2fd; padding: 20px; border-radius: 10px; margin: 20px 0; border-left: 4px solid #2196f3;">
+            <h3 style="color: #1976d2; margin-top: 0;">📋 Today's Running Summary</h3>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin: 15px 0;">
+                <div>
+                    <p><strong>Best Hours:</strong> {summary.get('best_hours', 0)} excellent conditions</p>
+                    <p><strong>Average Conditions:</strong> {summary.get('avg_score', 'N/A')}/5.0</p>
+                    <p><strong>Average Temperature:</strong> {summary.get('avg_temp', 'N/A')}°F</p>
+                </div>
+                <div>
+                    <p><strong>Air Quality:</strong> {summary.get('air_quality', 'Unknown')}</p>
+                    {"<p><strong>Estimated Calories:</strong> " + str(summary.get('estimated_calories', {}).get('estimated_calories', 'N/A')) + "</p>" if summary.get('estimated_calories') else ""}
+                </div>
+            </div>
+        """)
+        
+        # Best time recommendations
+        if summary.get('best_time'):
+            best = summary['best_time']
+            html_parts.append(f"""
+            <div style="background: rgba(76, 175, 80, 0.1); padding: 15px; border-radius: 8px; margin: 15px 0;">
+                <h4 style="color: #2e7d32; margin: 0 0 10px 0;">🏃⏱️ Best Running Time</h4>
+                <p><strong>{best.get('day', 'Today')} at {best.get('time', 'N/A')}</strong> - Score: {best.get('score', 'N/A')}/5.0</p>
+                <p><strong>Temperature:</strong> {best.get('temp', 'N/A')}°F</p>
+                <p><em>{best.get('reason', '')}</em></p>
+            </div>
+            """)
+        
+        if summary.get('second_best_time'):
+            second = summary['second_best_time']
+            html_parts.append(f"""
+            <div style="background: rgba(255, 193, 7, 0.1); padding: 15px; border-radius: 8px; margin: 15px 0;">
+                <h4 style="color: #f57c00; margin: 0 0 10px 0;">⭐ Alternative Time</h4>
+                <p><strong>{second.get('day', 'Today')} at {second.get('time', 'N/A')}</strong> - Score: {second.get('score', 'N/A')}/5.0</p>
+                <p><strong>Temperature:</strong> {second.get('temp', 'N/A')}°F</p>
+                <p><em>{second.get('reason', '')}</em></p>
+            </div>
+            """)
+        
+        html_parts.append("</div>")
+    
+    # Profile Section (if available)
+    profile = card_data.get('profile', {})
+    if profile and profile.get('has_profile'):
+        html_parts.append(f"""
+        <div style="background: #f8f9fa; padding: 20px; border-radius: 10px; margin: 20px 0; border-left: 4px solid #007bff;">
+            <h3 style="color: #007bff; margin-top: 0;">🌅🏃 Your Training Plan</h3>
+        """)
+        
+        if profile.get('plan'):
+            html_parts.append(f"<p><strong>Program:</strong> {profile['plan']}")
+            if profile.get('week'):
+                html_parts.append(f" - {profile['week']}")
+            html_parts.append("</p>")
+        
+        if profile.get('today_workout'):
+            html_parts.append(f"""
+            <div style="background: rgba(76, 175, 80, 0.1); padding: 15px; border-radius: 8px; margin: 15px 0;">
+                <h4 style="color: #2e7d32; margin: 0 0 10px 0;">Today's Workout</h4>
+                <p>{profile['today_workout']}</p>
+            </div>
+            """)
+        
+        # Add wellness components if selected
+        if profile.get('nutrition'):
+            nutrition = profile['nutrition']
+            html_parts.append(f"""
+            <div style="background: rgba(76, 175, 80, 0.1); padding: 15px; border-radius: 8px; margin: 15px 0;">
+                <h4 style="color: #2e7d32; margin: 0 0 10px 0;">🥗 Nutrition Plan</h4>
+                <p><strong>Pre-run:</strong> {nutrition.get('pre_run', 'N/A')}</p>
+                <p><strong>During:</strong> {nutrition.get('during', 'N/A')}</p>
+                <p><strong>Post-run:</strong> {nutrition.get('post_run', 'N/A')}</p>
+            </div>
+            """)
+        
+        if profile.get('strength_training'):
+            strength = profile['strength_training']
+            html_parts.append(f"""
+            <div style="background: rgba(255, 152, 0, 0.1); padding: 15px; border-radius: 8px; margin: 15px 0;">
+                <h4 style="color: #f57c00; margin: 0 0 10px 0;">🏋️ Strength Training</h4>
+                <p><strong>Schedule:</strong> {strength.get('schedule', 'N/A')}</p>
+                <p><strong>Focus:</strong> {strength.get('focus', 'N/A')}</p>
+                <p><strong>Exercises:</strong> {strength.get('exercises', 'N/A')}</p>
+            </div>
+            """)
+        
+        if profile.get('mindfulness'):
+            mindfulness = profile['mindfulness']
+            html_parts.append(f"""
+            <div style="background: rgba(156, 39, 176, 0.1); padding: 15px; border-radius: 8px; margin: 15px 0;">
+                <h4 style="color: #7b1fa2; margin: 0 0 10px 0;">🧘‍♂️ Mindfulness Practice</h4>
+                <p><strong>Daily Practice:</strong> {mindfulness.get('practice', 'N/A')}</p>
+                <p><strong>Running Focus:</strong> {mindfulness.get('running', 'N/A')}</p>
+                <p><strong>Recovery:</strong> {mindfulness.get('recovery', 'N/A')}</p>
+            </div>
+            """)
+        
+        html_parts.append("</div>")
+    
+    # Today's Hours
+    today_hours = card_data.get('today', [])
+    if today_hours:
+        html_parts.append(f"""
+        <div style="background: #fff3e0; padding: 20px; border-radius: 10px; margin: 20px 0; border-left: 4px solid #ff9800;">
+            <h3 style="color: #f57c00; margin-top: 0;">🌅 Today's Conditions</h3>
+        """)
+        
+        for hour in today_hours[:4]:  # Limit to 4 hours for email
+            score_color = get_score_color(hour.get('score', 0))
+            html_parts.append(f"""
+            <div style="background: white; padding: 15px; border-radius: 8px; margin: 10px 0; border-left: 3px solid {score_color};">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                    <h4 style="margin: 0; color: #333;">{hour.get('time', 'N/A')}</h4>
+                    <span style="background: {score_color}; color: white; padding: 4px 12px; border-radius: 20px; font-weight: bold;">
+                        {hour.get('score', 'N/A')}/5.0
+                    </span>
+                </div>
+                <p style="margin: 5px 0; color: #666;">
+                    <strong>{hour.get('temp', 'N/A')}°F</strong> • 
+                    💨 {hour.get('wind', 'N/A')}mph • 
+                    💧 {hour.get('humidity', 'N/A')}% • 
+                    🌧️ {hour.get('precip', 'N/A')}%
+                </p>
+                <p style="margin: 5px 0; font-style: italic; color: #555;">
+                    {hour.get('recommendation', 'No specific guidance')}
+                </p>
+            </div>
+            """)
+        
+        html_parts.append("</div>")
+    
+    # Tomorrow's Hours (if available)
+    tomorrow_hours = card_data.get('tomorrow', [])
+    if tomorrow_hours:
+        html_parts.append(f"""
+        <div style="background: #e8f5e9; padding: 20px; border-radius: 10px; margin: 20px 0; border-left: 4px solid #4caf50;">
+            <h3 style="color: #2e7d32; margin-top: 0;">🌄 Tomorrow's Preview</h3>
+        """)
+        
+        for hour in tomorrow_hours[:3]:  # Limit to 3 hours for email
+            score_color = get_score_color(hour.get('score', 0))
+            html_parts.append(f"""
+            <div style="background: white; padding: 15px; border-radius: 8px; margin: 10px 0; border-left: 3px solid {score_color};">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                    <h4 style="margin: 0; color: #333;">{hour.get('time', 'N/A')}</h4>
+                    <span style="background: {score_color}; color: white; padding: 4px 12px; border-radius: 20px; font-weight: bold;">
+                        {hour.get('score', 'N/A')}/5.0
+                    </span>
+                </div>
+                <p style="margin: 5px 0; color: #666;">
+                    <<strong>{hour.get('temp', 'N/A')}°F</strong> • 
+                    💨 {hour.get('wind', 'N/A')}mph • 
+                    💧 {hour.get('humidity', 'N/A')}% • 
+                    🌧️ {hour.get('precip', 'N/A')}%
+                </p>
+                <p style="margin: 5px 0; font-style: italic; color: #555;">
+                    {hour.get('recommendation', 'No specific guidance')}
+                </p>
+            </div>
+            """)
+        
+        html_parts.append("</div>")
+    
+    # Day's Plan (if available)
+    days_plan = card_data.get('days_plan')
+    if days_plan:
+        html_parts.append(f"""
+        <div style="background: #fce4ec; padding: 20px; border-radius: 10px; margin: 20px 0; border-left: 4px solid #e91e63;">
+            <h3 style="color: #c2185b; margin-top: 0;">🏋️ Today's Training Plan</h3>
+            <div style="background: white; padding: 15px; border-radius: 8px; white-space: pre-line; line-height: 1.6;">
+                {days_plan.get('content', 'No plan available')}
+            </div>
+        </div>
+        """)
+    
+    if not html_parts:
+        return f"<p>No detailed forecast information available for {city}. Please try again.</p>"
+    
+    return ''.join(html_parts)
+
+def get_score_color(score: float) -> str:
+    """Get color based on score for email formatting."""
+    if score >= 4.5:
+        return "#4CAF50"  # Green
+    elif score >= 4.0:
+        return "#8BC34A"  # Light Green
+    elif score >= 3.0:
+        return "#FF9800"  # Orange
+    elif score >= 2.0:
+        return "#FF5722"  # Red-Orange
+    else:
+        return "#F44336"  # Red
+
+def clean_html_for_email(html_content: str) -> str:
+    """Clean desktop HTML content for better email compatibility."""
+    import re
+    
+    # Remove any script tags
+    html_content = re.sub(r'<script[^>]*>.*?</script>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+    
+    # Remove any style tags (keep inline styles)
+    html_content = re.sub(r'<style[^>]*>.*?</style>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+    
+    # Convert any remaining complex CSS to simpler inline styles
+    html_content = re.sub(r'class="[^"]*"', '', html_content)
+    
+    # Ensure all links are absolute (if any)
+    # html_content = html_content.replace('href="/', 'href="https://yourdomain.com/')
+    
+    return html_content
+
+def generate_desktop_aligned_email_content(scored_hours: list, form_data: dict, profile_data: dict, city: str) -> str:
+    """Generate email content that exactly matches desktop view format and sequence."""
+    
+    if not scored_hours:
+        return f"<p>No detailed forecast information available for {city}. Please try again.</p>"
+    
+    email_content_parts = []
+    
+    # 1. First, add the runner profile section (if it exists) - EXACT same as desktop
+    if profile_data and profile_data.get('has_profile'):
+        try:
+            # Generate LLM profile content exactly as desktop does
+            from llm_prompts import format_runner_profile_prompt, get_llm_run_plan_summary
+            
+            runner_profile_prompt = format_runner_profile_prompt(form_data)
+            profile_html = get_llm_run_plan_summary(runner_profile_prompt)
+            
+            profile_section = f"""
+                <div style="margin: 20px 0; padding: 20px; background: #f8f9fa; border-radius: 8px; border-left: 4px solid #007bff;">
+                    <h3 style="color: #007bff; margin-top: 0;">Your Personalized Running Plan</h3>
+                    {profile_html}
+                </div>
+            """
+            email_content_parts.append(profile_section)
+            
+        except Exception as e:
+            logger.error(f"Error generating profile for email: {e}")
+    
+    # 2. Then add the forecast content - EXACT same as desktop using generate_compact_html_analysis
+    forecast_html = generate_compact_html_analysis(scored_hours, city)
+    email_content_parts.append(forecast_html)
+    
+    return ''.join(email_content_parts)
+
+def send_email_notification(recipient_email: str, subject: str, body: str, is_html: bool = True) -> bool:
+    """Sends an email using credentials from the .env file."""
+    try:
+        email_user = os.getenv("EMAIL_USER")
+        email_password = os.getenv("EMAIL_PASSWORD")
+        email_host = os.getenv("EMAIL_HOST", "smtp.gmail.com")
+        email_port = int(os.getenv("EMAIL_PORT", 587))
+
+        if not all([email_user, email_password]):
+            raise ValueError("Email credentials not set in .env file.")
+
+        msg = EmailMessage()
+        if is_html:
+            msg.set_content(body, subtype='html')
+        else:
+            msg.set_content(body)
+            
+        msg['Subject'] = subject
+        msg['From'] = email_user
+        msg['To'] = recipient_email
+
+        context = ssl.create_default_context()
+        with smtplib.SMTP(email_host, email_port) as server:
+            server.starttls(context=context)
+            server.login(email_user, email_password)
+            server.send_message(msg)
+        
+        logger.info(f"Successfully sent email to {recipient_email}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send email to {recipient_email}: {e}")
+        return False
+
+# --- Helper Functions ---
+
+def calculate_estimated_calories(age: int, weight: int, height_feet: int, height_inches: int, 
+                                 gender: str, activity_type: str, duration_minutes: int, 
+                                 intensity: str, dewpoint: float) -> dict:
+    """
+    Calculate estimated calories burned during running activity.
+    
+    Uses Metabolic Equivalent of Task (MET) values and accounts for:
+    - Individual physiology (age, weight, height, gender)
+    - Activity intensity
+    - Environmental stress (dewpoint/humidity impact)
+    """
+    
+    # DEBUG: Log input parameters
+    logger.info(f"=== CALORIE CALCULATION START ===")
+    logger.info(f"Inputs: age={age}, weight={weight}lbs, height={height_feet}'{height_inches}\", gender={gender}")
+    logger.info(f"Activity: {activity_type}, duration={duration_minutes}min, intensity={intensity}, dewpoint={dewpoint}°F")
+    
+    # Calculate BMR (Basal Metabolic Rate) using Mifflin-St Jeor Equation
+    height_cm = (height_feet * 12 + height_inches) * 2.54
+    weight_kg = weight * 0.453592
+    
+    if gender.lower() == 'male':
+        bmr = (10 * weight_kg) + (6.25 * height_cm) - (5 * age) + 5
+    else:  # female
+        bmr = (10 * weight_kg) + (6.25 * height_cm) - (5 * age) - 161
+    
+    logger.info(f"Calculated: height_cm={height_cm}, weight_kg={weight_kg:.2f}, BMR={bmr:.2f}")
+    
+    # MET values for different running intensities
+    met_values = {
+        'easy': 8.0,      # Easy/recovery pace
+        'moderate': 10.0, # Tempo/steady pace
+        'hard': 12.0,     # Threshold pace
+        'very_hard': 14.0 # Interval/race pace
+    }
+    
+    # Determine MET based on workout description
+    activity_lower = activity_type.lower()
+    duration_lower = str(duration_minutes).lower() if duration_minutes else ''
+    intensity_lower = intensity.lower() if intensity else ''
+    
+    logger.info(f"Analyzing workout: activity_lower='{activity_lower}', intensity_lower='{intensity_lower}'")
+    
+    if any(word in activity_lower for word in ['recovery', 'easy', 'light']):
+        met = met_values['easy']
+        logger.info(f"MET determination: Found 'recovery/easy/light' in activity -> MET={met}")
+    elif any(word in activity_lower for word in ['tempo', 'threshold', 'steady']):
+        met = met_values['moderate']
+        logger.info(f"MET determination: Found 'tempo/threshold/steady' in activity -> MET={met}")
+    elif any(word in activity_lower for word in ['interval', 'speed', 'hard', 'race']):
+        met = met_values['very_hard']
+        logger.info(f"MET determination: Found 'interval/speed/hard/race' in activity -> MET={met}")
+    elif intensity_lower in ['easy', 'light']:
+        met = met_values['easy']
+        logger.info(f"MET determination: Intensity is 'easy/light' -> MET={met}")
+    elif intensity_lower in ['moderate', 'steady']:
+        met = met_values['moderate']
+        logger.info(f"MET determination: Intensity is 'moderate/steady' -> MET={met}")
+    elif intensity_lower in ['hard', 'vigorous']:
+        met = met_values['hard']
+        logger.info(f"MET determination: Intensity is 'hard/vigorous' -> MET={met}")
+    elif intensity_lower in ['very hard', 'maximum']:
+        met = met_values['very_hard']
+        logger.info(f"MET determination: Intensity is 'very hard/maximum' -> MET={met}")
+    else:
+        met = met_values['moderate']  # Default
+        logger.info(f"MET determination: Using default -> MET={met}")
+    
+    # Base calorie calculation: MET * weight(kg) * duration(hours)
+    duration_hours = duration_minutes / 60
+    base_calories = met * weight_kg * duration_hours
+    
+    logger.info(f"Base calculation: MET({met}) × weight_kg({weight_kg:.2f}) × duration_hours({duration_hours:.2f}) = {base_calories:.2f} calories")
+    
+    # Environmental adjustment based on dewpoint
+    environmental_multiplier = 1.0
+    if dewpoint >= 70:
+        environmental_multiplier = 1.15  # 15% increase in high humidity
+        logger.info(f"Environmental adjustment: Dewpoint {dewpoint}°F >= 70 -> 15% increase")
+    elif dewpoint >= 65:
+        environmental_multiplier = 1.10  # 10% increase in moderate-high humidity
+        logger.info(f"Environmental adjustment: Dewpoint {dewpoint}°F >= 65 -> 10% increase")
+    elif dewpoint >= 60:
+        environmental_multiplier = 1.05  # 5% increase in moderate humidity
+        logger.info(f"Environmental adjustment: Dewpoint {dewpoint}°F >= 60 -> 5% increase")
+    else:
+        logger.info(f"Environmental adjustment: Dewpoint {dewpoint}°F < 60 -> No adjustment")
+    
+    adjusted_calories = base_calories * environmental_multiplier
+    
+    result = {
+        'estimated_calories': round(adjusted_calories),
+        'base_calories': round(base_calories),
+        'environmental_adjustment': round((environmental_multiplier - 1.0) * 100),
+        'met_value': met,
+        'intensity_level': 'Easy' if met <= 8 else 'Moderate' if met <= 10 else 'Hard' if met <= 12 else 'Very Hard',
+        'dewpoint_impact': 'High' if dewpoint >= 70 else 'Moderate' if dewpoint >= 60 else 'Low'
+    }
+    
+    logger.info(f"Final result: {result}")
+    logger.info(f"=== CALORIE CALCULATION END ===")
+    
+    return result
+
+def calculate_safe_heart_rate_zones(age: int, has_conditions: bool = False) -> dict:
+    """Calculate safe heart rate zones based on age and health status."""
+    if not age or age < 15 or age > 100:
+        return {}
+    
+    max_hr = 220 - age
+    
+    if has_conditions:
+        # Conservative zones for people with health conditions
+        zones = {
+            'easy': (int(max_hr * 0.50), int(max_hr * 0.60)),
+            'moderate': (int(max_hr * 0.60), int(max_hr * 0.70)),
+            'hard': (int(max_hr * 0.70), int(max_hr * 0.75)),
+            'warning': 'Due to health conditions, stay below 75% max heart rate unless cleared by doctor'
+        }
+    else:
+        # Standard zones for healthy individuals
+        zones = {
+            'easy': (int(max_hr * 0.60), int(max_hr * 0.70)),
+            'moderate': (int(max_hr * 0.70), int(max_hr * 0.80)),
+            'hard': (int(max_hr * 0.80), int(max_hr * 0.90)),
+            'warning': 'Stay below 90% max heart rate'
+        }
+    
+    zones['max_hr'] = max_hr
+    return zones
+
+def extract_main_reason(recommendation: str) -> str:
+    """Extract the main reason from a recommendation string, skipping 'comfortable temperature' messages."""
+    if ': ' in recommendation:
+        parts = recommendation.split(': ', 1)
+        if len(parts) > 1:
+            # Split the detailed part by bullet points or other separators
+            detail_parts = parts[1].split(' • ')[0].strip()
+            
+            # Filter out comfortable temperature messages
+            filtered_parts = []
+            for part in detail_parts:
+                part = part.strip()
+                if (not part.lower().startswith('comfortable temperature') and 
+                    'comfortable temperature for running' not in part.lower() and
+                    len(part) > 10):  # Ensure meaningful content
+                    filtered_parts.append(part)
+            
+            # Return first meaningful alternative, or truncate original
+            if filtered_parts:
+                first_reason = filtered_parts[0]
+                return first_reason[:100] + '...' if len(first_reason) > 100 else first_reason
+            else:
+                # Fallback to truncated original
+                first_reason = parts[1].split(' • ')[0].strip()
+                return first_reason[:100] + '...' if len(first_reason) > 100 else first_reason
+    
+    return recommendation[:100] + '...' if len(recommendation) > 100 else recommendation
+
+def format_hour_for_card(hour_data: dict) -> dict:
+    """Format hour data for card display."""
+    return {
+        'time': hour_data.get('Hour', 'N/A'),
+        'score': round(hour_data.get('raw_score', 0), 1),
+        'score_text': get_score_text(hour_data.get('raw_score', 0)),
+        'temp': hour_data.get('Temp', 'N/A'),
+        'wind': hour_data.get('Wind', 'N/A'),
+        'humidity': hour_data.get('Humidity', 'N/A'),
+        'precip': hour_data.get('Precip', 'N/A'),
+        'recommendation': extract_main_reason(hour_data.get('running_recommendation', '')),
+        'heat_stress': hour_data.get('heat_stress_level', 'Unknown')
+    }
+
+def get_score_text(score: float) -> str:
+    """Convert numeric score to text description."""
+    if score >= 4.5:
+        return "Perfect"
+    elif score >= 4.0:
+        return "Great" 
+    elif score >= 3.5:
+        return "Moderate"
+    elif score >= 3.0:
+        return "Manageable"
+    elif score >= 2.0:
+        return "Poor"
+    else:
+        return "Avoid"
+
+def get_formatted_date_display() -> str:
+    """Generate a dynamic date display for the current date."""
+    now = datetime.now()
+    formatted_date = now.strftime("%a, %b %d")
+    
+    date_display = f"""
+    <div style="
+        display: inline-block; 
+        background: linear-gradient(135deg, #4CAF50, #2E7D32); 
+        color: white; 
+        padding: 8px 16px; 
+        border-radius: 8px; 
+        font-weight: bold; 
+        font-size: 16px; 
+        text-align: center; 
+        margin-right: 10px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+    ">
+        {formatted_date}
+    </div>"""
+    
+    return date_display
+
+def get_formatted_tomorrow_date_display() -> str:
+    """Generate a dynamic date display for tomorrow's date."""
+    tomorrow = datetime.now() + timedelta(days=1)
+    formatted_date = tomorrow.strftime("%a, %b %d")
+    
+    date_display = f"""
+    <div style="
+        display: inline-block; 
+        background: linear-gradient(135deg, #2196F3, #1565C0); 
+        color: white; 
+        padding: 8px 16px; 
+        border-radius: 8px; 
+        font-weight: bold; 
+        font-size: 16px; 
+        text-align: center; 
+        margin-right: 10px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+    ">
+        {formatted_date}
+    </div>"""
+
+    return date_display
+
+def parse_weather_data(forecast_data: str) -> dict:
+    """Parse weather forecast data from MCP server JSON output."""
+    
+    logger.info(f"Parsing forecast data, length: {len(forecast_data) if forecast_data else 0}")
+    
+    if not forecast_data or not forecast_data.strip():
+        logger.info("Received empty forecast data")
+        return {'today': [], 'tomorrow': []}
+    
+    forecast_data_stripped = forecast_data.strip()
+    if forecast_data_stripped.startswith('{'):
+        return parse_json_weather_data(forecast_data_stripped)
+    else:
+        logger.warning("Using pipe-delimited fallback")
+        return parse_pipe_delimited_weather_data(forecast_data_stripped)
+
+def parse_json_weather_data(forecast_data: str) -> dict:
+    """Parse JSON weather data from the MCP server."""
+    try:
+        weather_json = json.loads(forecast_data)
+        periods = weather_json.get('properties', {}).get('periods', [])
+        
+        if not periods:
+            return {'today': [], 'tomorrow': []}
+        
+        today_data, tomorrow_data = [], []
+        now = datetime.now()
+        today_date, tomorrow_date = now.date(), now.date() + timedelta(days=1)
+        
+        for period in periods:
+            try:
+                day_category = period.get('day_category', '')
+                parsed_hour = period.get('parsed_hour', 'N/A')
+                
+                if parsed_hour == 'N/A': 
+                    continue
+                
+                hour_num = parsed_hour
+                if hour_num == 0: 
+                    formatted_hour = "12:00 AM"
+                elif hour_num < 12: 
+                    formatted_hour = f"{hour_num}:00 AM"
+                elif hour_num == 12: 
+                    formatted_hour = "12:00 PM"
+                else: 
+                    formatted_hour = f"{hour_num - 12}:00 PM"
+                
+                temp = period.get('temperature', 'N/A')
+                wind_speed_str = str(period.get('wind_speed', '0 mph'))
+                wind_match = re.search(r'(\d+)', wind_speed_str)
+                wind = int(wind_match.group(1)) if wind_match else 0
+                precip = period.get('precipitation', 0)
+                humidity = period.get('humidity', 'N/A')
+                forecast = period.get('forecast', 'N/A')
+                dewpoint = period.get('dewpoint_fahrenheit', 'N/A')
+
+                weather_entry = {
+                    'Hour': formatted_hour, 
+                    'HourNum': hour_num, 
+                    'Temp': temp,
+                    'Wind': wind, 
+                    'Precip': precip, 
+                    'Humidity': humidity,
+                    'Forecast': forecast, 
+                    'dewpoint_fahrenheit': dewpoint,
+                    'solar_phase': period.get('solar_phase', 'unknown'),
+                    'is_solar_time': period.get('is_solar_time', False),
+                    'solar_score': period.get('solar_score', 'N/A'),
+                    'day_category': day_category
+                }
+                
+                if 'TODAY' in day_category.upper():
+                    weather_entry['Day'] = 'today'
+                    today_data.append(weather_entry)
+                elif 'TOMORROW' in day_category.upper():
+                    weather_entry['Day'] = 'tomorrow'
+                    tomorrow_data.append(weather_entry)
+                        
+            except Exception as e:
+                logger.warning(f"Error parsing period: {e}")
+                continue
+        
+        today_data.sort(key=lambda x: x.get('HourNum', 0))
+        tomorrow_data.sort(key=lambda x: x.get('HourNum', 0))
+        
+        return {'today': today_data, 'tomorrow': tomorrow_data}
+        
+    except Exception as e:
+        logger.error(f"Error in parse_json_weather_data: {e}")
+        return {'today': [], 'tomorrow': []}
+
+def parse_pipe_delimited_weather_data(forecast_data: str) -> dict:
+    """Fallback parser for pipe-delimited weather data."""
+    weather_lines = [line.strip() for line in forecast_data.split('\n') if line.strip()]
+    
+    if not weather_lines:
+        return {'today': [], 'tomorrow': []}
+    
+    data_lines = []
+    for line in weather_lines:
+        if '|' in line and re.search(r'\d+', line) and not line.startswith('+=') and not line.startswith('+--'):
+            if not any(header in line.lower() for header in ['num', 'time', 'temp', 'wind', 'forecast', 'precip', 'humidity']):
+                data_lines.append(line)
+    
+    today_data = []
+    tomorrow_data = []
+    
+    for line_num, line in enumerate(data_lines):
+        try:
+            if '|' in line:
+                parts = [part.strip() for part in line.split('|') if part.strip()]
+                if len(parts) >= 8:
+                    hour_str = parts[1]
+                    temp_str = parts[2]
+                    wind_str = parts[3]
+                    forecast_str = parts[5] if len(parts) > 5 else "N/A"
+                    precip_str = parts[6] if len(parts) > 6 else "N/A"
+                    humidity_str = parts[7] if len(parts) > 7 else "N/A"
+                    
+                    # Extract hour number
+                    hour_match = re.search(r'(\d{1,2})', hour_str)
+                    if hour_match:
+                        hour_num = int(hour_match.group(1))
+                        if hour_num == 0:
+                            formatted_hour = "12:00 AM"
+                        elif hour_num < 12:
+                            formatted_hour = f"{hour_num}:00 AM"
+                        elif hour_num == 12:
+                            formatted_hour = "12:00 PM"
+                        else:
+                            formatted_hour = f"{hour_num - 12}:00 PM"
+                    else:
+                        hour_num = "N/A"
+                        formatted_hour = "N/A"
+                    
+                    # Extract numeric values
+                    temp_numbers = re.findall(r'\d+', temp_str)
+                    temp = int(temp_numbers[0]) if temp_numbers else "N/A"
+                    
+                    wind_numbers = re.findall(r'\d+', wind_str)
+                    wind = int(wind_numbers[0]) if wind_numbers else "N/A"
+                    
+                    precip_numbers = re.findall(r'\d+', precip_str)
+                    precip = int(precip_numbers[0]) if precip_numbers else "N/A"
+                    
+                    humidity_numbers = re.findall(r'\d+', humidity_str)
+                    humidity = int(humidity_numbers[0]) if humidity_numbers else "N/A"
+                    
+                    forecast = forecast_str.strip() if forecast_str.strip() else "N/A"
+                    
+                    weather_entry = {
+                        'Hour': formatted_hour,
+                        'HourNum': hour_num,
+                        'Temp': temp,
+                        'Wind': wind,
+                        'Precip': precip,
+                        'Humidity': humidity,
+                        'Forecast': forecast
+                    }
+                    
+                    # Sequential assignment (first 24 hours = today, next 24 = tomorrow)
+                    if line_num < 24:
+                        weather_entry['Day'] = 'today'
+                        today_data.append(weather_entry)
+                    else:
+                        weather_entry['Day'] = 'tomorrow'
+                        tomorrow_data.append(weather_entry)
+                        
+        except (ValueError, IndexError) as e:
+            logger.warning(f"Error parsing line {line_num}: {e}")
+            continue
+    
+    today_data.sort(key=lambda x: x['HourNum'] if x['HourNum'] != "N/A" else 0)
+    tomorrow_data.sort(key=lambda x: x['HourNum'] if x['HourNum'] != "N/A" else 0)
+    
+    return {'today': today_data, 'tomorrow': tomorrow_data}
+
+def calculate_rwi_score(temperature, humidity, wind_speed, precipitation, forecast, dewpoint_fahrenheit, hour_data=None):
+    """Calculate RWI using enhanced solar data when available."""
+    try:
+        # Parse inputs
+        if isinstance(wind_speed, str):
+            wind_match = re.search(r'(\d+)', str(wind_speed))
+            wind_speed = int(wind_match.group(1)) if wind_match else 0
+        
+        temp = float(temperature) if temperature != "N/A" else 70
+        humid = float(humidity) if humidity != "N/A" else 50
+        wind = float(wind_speed) if wind_speed != "N/A" else 0
+        precip = float(precipitation) if precipitation != "N/A" else 0
+        dewpoint = float(dewpoint_fahrenheit) if dewpoint_fahrenheit != "N/A" else temp - 15
+        
+        # Use enhanced RWI calculation
+        result = calculate_rwi(temp, humid, wind, precip, forecast, dewpoint)
+        
+        # Add solar enhancement if available
+        if hour_data and 'solar_score' in hour_data:
+            solar_score = float(hour_data['solar_score'])
+            # Adjust the solar component in the result
+            result['components']['solar_conditions'] = solar_score
+            logger.info(f"Using enhanced solar score {solar_score} from server")
+        
+        return result
+        
+    except Exception as e:
+        logger.warning(f"RWI calculation failed: {e}")
+        return {
+            'rwi_score': 3.0, 
+            'rating': 3, 
+            'heat_index': float(temperature) if temperature != "N/A" else 70.0,
+            'components': {
+                'thermal_comfort': 3.0, 
+                'solar_conditions': 3.0, 
+                'wind': 3.0, 
+                'precipitation': 3.0, 
+                'dewpoint_comfort': 3.0
+            }
+        }
+
+def score_hour_with_scientific_approach(hour_data, aqi_value=None):
+    """Enhanced scoring with solar-aware RWI integration."""
+    # Extract basic weather data
+    temp = hour_data.get('temperature', hour_data.get('Temp', 'N/A'))
+    wind = hour_data.get('wind_speed', hour_data.get('Wind', 'N/A'))
+    humidity = hour_data.get('humidity', hour_data.get('Humidity', 'N/A'))
+    precip = hour_data.get('precipitation', hour_data.get('Precip', 'N/A'))
+    dewpoint = hour_data.get('dewpoint_fahrenheit', 'N/A')
+    forecast = str(hour_data.get('forecast', hour_data.get('Forecast', 'N/A')))
+    
+    # Parse wind speed
+    if isinstance(wind, str) and wind != "N/A":
+        wind_match = re.search(r'(\d+)', wind)
+        wind = int(wind_match.group(1)) if wind_match else 0
+    
+    # Handle missing data
+    if temp == "N/A": temp = 70
+    if humidity == "N/A": humidity = 50
+    if wind == "N/A": wind = 0
+    if precip == "N/A": precip = 0
+    if dewpoint == "N/A": dewpoint = temp - 15
+    
+    # Use RWI for scoring
+    rwi_result = calculate_rwi_score(temp, humidity, wind, precip, forecast, dewpoint, hour_data)
+    final_score = rwi_result['rating'] 
+    raw_score = rwi_result['rwi_score'] 
+    heat_index = rwi_result['heat_index']
+    rwi_components = rwi_result['components']
+    
+    # Temperature safety overrides
+    if temp >= 90:
+        final_score = 1
+        raw_score = 1.0
+    elif temp >= 85:
+        final_score = 2
+        raw_score = 2.0
+    
+    # Enhanced heat stress calculation
+    heat_stress_level = calculate_enhanced_heat_stress(temp, dewpoint, hour_data)
+    
+    # Generate recommendations
+    recommendation = generate_solar_aware_recommendation(temp, dewpoint, wind, forecast, final_score, raw_score, hour_data)
+    
+    return {
+        **hour_data,
+        'raw_score': raw_score, 
+        'score_100': final_score * 20,
+        'final_score': final_score, 
+        'heat_stress_level': heat_stress_level,
+        'aqi_category': get_aqi_category(aqi_value),
+        'running_recommendation': recommendation,
+        'heat_index': heat_index,
+        'rwi_components': rwi_components
+    }
+
+def calculate_enhanced_heat_stress(temp, dewpoint, hour_data):
+    """Calculate heat stress considering solar phase."""
+    if temp == "N/A" or dewpoint == "N/A":
+        return "Unknown"
+    
+    solar_phase = hour_data.get('solar_phase', 'unknown')
+    is_solar_time = hour_data.get('is_solar_time', None)
+    
+    # More accurate nighttime detection
+    is_nighttime = (solar_phase == 'night') or (is_solar_time is False and solar_phase in ['civil_twilight_dawn', 'civil_twilight_dusk'])
+    
+    if is_nighttime:
+        # Nighttime thresholds - higher since no solar load
+        if temp <= 75 and dewpoint <= 68:
+            return "Minimal"
+        elif temp <= 80 and dewpoint <= 72:
+            return "Low"
+        elif temp <= 85 and dewpoint <= 75:
+            return "Moderate"
+        elif temp <= 90 and dewpoint <= 78:
+            return "High"
+        else:
+            return "Extreme"
+    else:
+        # Daytime thresholds
+        if dewpoint <= 55 and temp <= 70:
+            return "Minimal"
+        elif dewpoint <= 60 and temp <= 75:
+            return "Low"
+        elif dewpoint <= 65 and temp <= 80:
+            return "Moderate"
+        elif dewpoint <= 70 and temp <= 85:
+            return "High"
+        else:
+            return "Extreme"
+
+def generate_solar_aware_recommendation(temp, dewpoint, wind, forecast, final_score, raw_score, hour_data):
+    """Generate recommendations using enhanced solar data."""
+    recommendations = []
+    
+    # Temperature assessment
+    if temp >= 90:
+        recommendations.append("Dangerous heat conditions - avoid outdoor running")
+    elif temp >= 85:
+        recommendations.append("High heat stress - easy pace only with frequent breaks")
+    elif temp >= 80:
+        recommendations.append("Hot conditions - reduce intensity and increase hydration")
+    elif temp >= 75:
+        recommendations.append("Warm conditions requiring attention to hydration")
+    elif temp >= 65:
+        recommendations.append("Comfortable temperature for running")
+    elif temp >= 50:
+        recommendations.append("Cool but comfortable - allow extra warm-up time")
+    elif temp >= 40:
+        recommendations.append("Cold conditions - extend warm-up and dress in layers")
+    else:
+        recommendations.append("Very cold conditions - take precautions against frostbite")
+
+    # Enhanced solar guidance
+    solar_phase = hour_data.get('solar_phase', 'unknown')
+    solar_explanation = hour_data.get('solar_explanation', '')
+    is_solar_time = hour_data.get('is_solar_time', None)
+    
+    if solar_explanation:
+        recommendations.append(solar_explanation)
+    elif solar_phase == 'night':
+        if 'clear' in forecast.lower():
+            recommendations.append("Clear night skies aid natural cooling")
+    elif solar_phase == 'daylight' and is_solar_time:
+        if 'sunny' in forecast.lower() and temp > 70:
+            recommendations.append("Direct sunlight increases effective temperature")
+    
+    # Humidity and wind
+    if dewpoint >= 65:
+        recommendations.append(f"High humidity (dewpoint <strong>{dewpoint}°F</strong>) affects cooling significantly")
+    elif dewpoint >= 60:
+        recommendations.append(f"Noticeable humidity (dewpoint <strong>{dewpoint}°F</strong>)")
+    
+    if wind == 0:
+        recommendations.append("No wind reduces natural cooling effectiveness")
+    elif wind <= 3:
+        recommendations.append("Minimal wind - heat retention may increase during exercise")
+    
+    # Overall assessment header
+    if final_score >= 4:
+        if temp >= 75 or raw_score < 4.0:
+            header = "Good Conditions"
+        else:
+            header = "Good to Excellent Conditions"
+    elif final_score == 3:
+        header = "Fair Conditions"
+    else:
+        header = "Challenging Conditions"
+
+    rec_list = " • ".join(recommendations)
+    return f"{header}: {rec_list}"
+
+def get_aqi_category(aqi_value):
+    """Get AQI health category."""
+    if aqi_value is None or aqi_value == "N/A":
+        return "Unknown"
+    elif aqi_value <= 50:
+        return "Good"
+    elif aqi_value <= 100:
+        return "Moderate"
+    elif aqi_value <= 150:
+        return "Unhealthy for Sensitive"
+    elif aqi_value <= 200:
+        return "Unhealthy"
+    elif aqi_value <= 300:
+        return "Very Unhealthy"
+    else:
+        return "Hazardous"
+
+def render_hour_card(hour, day_color, day_bg):
+    """Enhanced hour card rendering with forecast display."""
+    final_score = hour['final_score']
+    
+    score_colors = {
+        5: ("#4CAF50", "#E8F5E8"),
+        4: ("#8BC34A", "#F1F8E9"),
+        3: ("#FF9800", "#FFF3E0"),
+        2: ("#FF5722", "#FFF3E0"),
+        1: ("#F44336", "#FFEBEE")
+    }
+    score_color, score_bg = score_colors.get(final_score, score_colors[1])
+    
+    raw_score = hour.get('raw_score', 0.0)
+    
+    # Status display
+    if raw_score >= 4.5:
+        status_display = "⭐ EXCELLENT"
+    elif raw_score >= 4.0:
+        status_display = "🌟 FAVORABLE"
+    elif raw_score >= 3.5:
+        status_display = "✨ DECENT"
+    elif raw_score >= 3.0:
+        status_display = "🧡 MODERATE"
+    elif raw_score >= 2.0:
+        status_display = "⛔ STRESSFUL"
+    else:
+        status_display = "🚫 UNSAFE"
+
+    score_display = f"{raw_score:.2f}/5"
+
+    weather_details = format_weather_line_with_na(hour)
+    heat_stress = hour.get('heat_stress_level', 'Unknown')
+    aqi_category = hour.get('aqi_category', 'Unknown')
+    recommendation = hour.get('running_recommendation', 'No specific recommendation')
+    
+    # Get forecast description
+    forecast_desc = hour.get('Forecast', 'N/A')
+    
+    # Solar information
+    solar_info = ""
+    if 'solar_phase' in hour:
+        solar_phase = hour['solar_phase']
+        solar_score = hour.get('solar_score', 'N/A')
+        is_solar = hour.get('is_solar_time', False)
+        
+        phase_icons = {
+            'night': '🌙',
+            'civil_twilight_dawn': '🌅',
+            'daylight': '☀️',
+            'civil_twilight_dusk': '🌇'
+        }
+
+        solar_icon = phase_icons.get(solar_phase, '🌑')
+        solar_status = "Solar" if is_solar else "Non-solar"
+        
+        solar_info = f"""
+            <div style="margin-top: 8px; font-size: 14px; background: rgba(255,255,255,0.7); padding: 6px; border-radius: 6px;">
+                {solar_icon} <strong>Solar:</strong> {solar_phase.replace('_', ' ').title()} ({solar_status}, score: {solar_score})
+            </div>
+        """
+    
+    # Dewpoint information
+    dewpoint_info = ""
+    if hour.get('dewpoint_fahrenheit', 'N/A') != 'N/A':
+        dewpoint = hour['dewpoint_fahrenheit']
+        if dewpoint <= 55:
+            dewpoint_color = "#4CAF50"
+            dewpoint_desc = "Comfortable"
+        elif dewpoint <= 65:
+            dewpoint_color = "#FF9800"
+            dewpoint_desc = "Noticeable"
+        else:
+            dewpoint_color = "#F44336"
+            dewpoint_desc = "Oppressive"
+        
+        dewpoint_info = f"""
+            <div style="margin-top: 8px; font-size: 14px;">
+                ð§ <strong>Dew Point:</strong> <span style="color: {dewpoint_color}; font-weight: bold;">{dewpoint}°F ({dewpoint_desc})</span>
+            </div>
+        """
+    
+    heat_stress_colors = {
+        'Minimal': '#4CAF50', 'Low': '#8BC34A', 'Moderate': '#FF9800',
+        'High': '#FF5722', 'Extreme': '#F44336', 'Unknown': '#999'
+    }
+    heat_stress_color = heat_stress_colors.get(heat_stress, '#999')
+    
+    aqi_colors = {
+        'Good': '#4CAF50', 'Moderate': '#FF9800', 'Unhealthy for Sensitive': '#FF5722',
+        'Unhealthy': '#F44336', 'Very Unhealthy': '#9C27B0', 'Hazardous': '#7B1FA2', 'Unknown': '#999'
+    }
+    aqi_color = aqi_colors.get(aqi_category, '#999')
+    
+    # Remove the header from recommendation - just show the details
+    if ": " in recommendation:
+        recommendation_parts = recommendation.split(": ", 1)
+        if len(recommendation_parts) > 1:
+            recommendation = recommendation_parts[1]
+    
+    return f"""
+        <div style="background: {score_bg}; border: 2px solid {score_color}; border-radius: 12px; padding: 16px; margin: 12px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap;">
+                <h3 style="margin: 0; font-size: 20px; color: #333; font-weight: bold;">🕐 {hour['Hour']}</h3>
+                <div style="display: flex; flex-direction: column; align-items: flex-end;">
+                    <div style="color: {score_color}; font-weight: bold; font-size: 18px; background: white; padding: 6px 12px; border-radius: 20px; border: 2px solid {score_color};">
+                        {score_display}
+                    </div>
+                    <div style="color: {score_color}; font-weight: bold; font-size: 12px; margin-top: 4px;">
+                        {status_display}
+                    </div>
+                </div>
+            </div>
+            <div style="font-size: 15px; font-weight: bold; margin-bottom: 8px;">
+                {weather_details}
+            </div>
+            <div style="margin-top: 8px; padding: 8px; background: rgba(33, 150, 243, 0.1); border-left: 3px solid #2196F3; border-radius: 6px; font-size: 14px;">
+                <strong> Conditions:</strong> {forecast_desc}
+            </div>
+            {dewpoint_info}
+            {solar_info}
+            <div style="margin-top: 10px; display: flex; flex-wrap: wrap; gap: 10px; font-size: 13px;">
+                <div style="background: {heat_stress_color}20; color: {heat_stress_color}; padding: 4px 8px; border-radius: 6px; font-weight: bold; border: 1px solid {heat_stress_color};">
+                    🌡️ Heat Stress: {heat_stress}
+                </div>
+                <div style="background: {aqi_color}20; color: {aqi_color}; padding: 4px 8px; border-radius: 6px; font-weight: bold; border: 1px solid {aqi_color};">
+                    😤 Air Quality: {aqi_category}
+                </div>
+            </div>
+            <div style="margin-top: 12px; padding: 10px; background: rgba(255,255,255,0.7); border-radius: 8px; font-size: 14px; font-style: italic; color: #555;">
+                💡 {recommendation}
+            </div>
+        </div>
+    """
+
+def format_weather_line_with_na(hour):
+    """Format a weather line handling N/A values."""
+    def format_value_with_na(value, unit="", na_display="N/A"):
+        if value == "N/A":
+            return f"<span style='color: #999; font-style: italic;'>{na_display}</span>"
+        else:
+            return f"<span style='font-weight: bold;'>{value}{unit}</span>"
+
+    temp_display = format_value_with_na(hour['Temp'], "°F")
+    wind_display = format_value_with_na(hour['Wind'], "mph")
+    precip_display = format_value_with_na(hour['Precip'], "%")
+    humidity_display = format_value_with_na(hour['Humidity'], "%")
+    
+    # Color coding for temperature
+    if hour['Temp'] != "N/A":
+        if hour['Temp'] >= 75:
+            temp_context = f"🌡️ <span style='color: #FF6B35;'>{temp_display}</span>"
+        elif hour['Temp'] <= 35:
+            temp_context = f"❄️ <span style='color: #4FC3F7;'>{temp_display}</span>"
+        else:
+            temp_context = f"🌤️ <span style='color: #4CAF50;'>{temp_display}</span>"
+    else:
+        temp_context = f"🌡️ {temp_display}"
+
+    # Color coding for wind
+    if hour['Wind'] != "N/A":
+        if hour['Wind'] > 15:
+            wind_context = f"💨 <span style='color: #FF5722;'>{wind_display}</span>"
+        elif hour['Wind'] <= 5:
+            wind_context = f"🍃 <span style='color: #4CAF50;'>{wind_display}</span>"
+        else:
+            wind_context = f"💨 {wind_display}"
+    else:
+        wind_context = f"💨 {wind_display}"
+
+    # Color coding for precipitation
+    if hour['Precip'] != "N/A":
+        if hour['Precip'] > 30:
+            precip_context = f"🌧️ <span style='color: #2196F3;'>{precip_display}</span> rain"
+        elif hour['Precip'] > 10:
+            precip_context = f"☁️ <span style='color: #607D8B;'>{precip_display}</span> rain"
+        elif hour['Precip'] > 0:
+            precip_context = f"🌦️ <span style='color: #FFA726;'>{precip_display}</span> rain"
+        else:
+            # Check solar phase for appropriate icon
+            if hour.get('solar_phase') == 'night':
+             precip_context = f"🌙 <span style='color: #4CAF50;'>{precip_display}</span> rain"
+            else:
+                precip_context = f"☀️ <span style='color: #4CAF50;'>{precip_display}</span> rain"
+    else:
+        precip_context = f"🌧️ {precip_display} rain"
+
+    # Color coding for humidity
+    if hour['Humidity'] != "N/A":
+        if hour['Humidity'] > 80:
+         humidity_context = f"💧 <span style='color: #2196F3;'>{humidity_display}</span> humidity"
+        elif hour['Humidity'] > 60:
+            humidity_context = f"💧 <span style='color: #FF9800;'>{humidity_display}</span> humidity"
+        else:
+            humidity_context = f"💧 <span style='color: #4CAF50;'>{humidity_display}</span> humidity"
+    else:
+        humidity_context = f"💧 {humidity_display} humidity"
+
+    return f"{temp_context} • {wind_context} • {precip_context} • {humidity_context}"
+
+
+# --- Generation Functions ---
+
+def generate_compact_html_analysis(scored_data: List, city: str) -> str:
+    """Generate a compact HTML forecast with final styling."""
+    if not scored_data:
+        return f"<div style='color: red;'>No weather data available for {city}.</div>"
+
+    # Header with global message
+    header_line = f"<h2 style='color: #333; margin-bottom: 5px;'>Running Forecast for {city}</h2>"
+    monitor_line = "<div style='font-weight: bold; color: #FF6600; margin-bottom: 20px;'>🩺 Monitor your body's response and adjust as needed.</div>"
+    html_parts = [header_line, monitor_line]
+    
+    for hour in scored_data:
+        # Date logic and color selection
+        clean_date_for_line = ""
+        date_color = "#4169E1"  # Default/Today color
+        try:
+            day_category = hour.get('day_category', 'Date Unknown')
+            if 'TOMORROW' in day_category.upper():
+                date_color = "#9932CC"  # Tomorrow color
+
+            date_part = day_category.split('-')[1]
+            day_of_week = date_part.split(', ')[1][:3]
+            month_day = date_part.split(', ')[0]
+            clean_date_for_line = f"{day_of_week}, {month_day}"
+
+        except (IndexError, AttributeError):
+            clean_date_for_line = ""
+
+        # Data extraction
+        time_str = hour.get('Hour', 'N/A').replace(':00', '')
+        temp = hour.get('Temp', 'N/A')
+        dew_point = hour.get('dewpoint_fahrenheit', 'N/A')
+        wind = hour.get('Wind', 'N/A')
+        humidity = hour.get('Humidity', 'N/A')
+        precip = hour.get('Precip', 'N/A')
+        raw_score = hour.get('raw_score', 0.0)
+        final_score = hour.get('final_score', 0)
+        full_recommendation = hour.get('running_recommendation', 'No recommendation available.')
+        forecast_str = hour.get('Forecast', 'N/A')  # Get forecast description
+        solar_phase = hour.get('solar_phase', 'daylight')
+
+        # Weather icon logic (FIXED INDENTATION)
+        weather_icon = '🌤️'  # default partly sunny
+        if temp != 'N/A' and temp >= 90: 
+            weather_icon = '🌡️'   # hot
+        elif 'thunder' in forecast_str.lower(): 
+            weather_icon = '⛈️'   # thunderstorm
+        elif solar_phase == 'night': 
+            weather_icon = '🌙'   # night
+        elif 'sunny' in forecast_str.lower() or 'clear' in forecast_str.lower(): 
+            weather_icon = '☀️'   # sunny/clear
+        elif 'partly' in forecast_str.lower(): 
+            weather_icon = '🌤️'   # partly sunny
+        elif 'cloudy' in forecast_str.lower(): 
+            weather_icon = '☁️'   # cloudy
+        elif 'rain' in forecast_str.lower(): 
+            weather_icon = '🌧️'   # rain
+        
+        # Color coding
+        score_colors = {
+            5: ("#4CAF50", "#E8F5E8"), 4: ("#8BC34A", "#F1F8E9"),
+            3: ("#FF9800", "#FFF3E0"), 2: ("#FF5722", "#FFF3E0"),
+            1: ("#F44336", "#FFEBEE"), 0: ("#9E9E9E", "#F5F5F5")
+        }
+        score_color, score_bg = score_colors.get(final_score, score_colors[0])
+        
+        # Score emoji logic (FIXED INDENTATION)
+        if raw_score >= 4.5: 
+            score_emoji = "🏃‍♂️🏃‍♀️🏃"   # Best Weather
+        elif raw_score >= 4.0: 
+            score_emoji = "🏃‍♀️🏃‍♂️"     # Good Weather
+        elif raw_score >= 3.5: 
+            score_emoji = "🏃‍♂️"       # Ok Weather
+        elif raw_score >= 3.0: 
+            score_emoji = "💪🏃‍♀️"     # High effort
+        elif raw_score >= 2.0: 
+            score_emoji = "🔶"       # Bad Weather
+        else: 
+            score_emoji = "⛔️"       # warning
+
+        # Status display
+        if raw_score >= 4.5:
+            status_display = "⭐ EXCELLENT"
+        elif raw_score >= 4.0:
+            status_display = "🌟 FAVORABLE"
+        elif raw_score >= 3.5:
+            status_display = "✨ DECENT"
+        elif raw_score >= 3.0:
+            status_display = "🧡 MODERATE"
+        elif raw_score >= 2.0:
+            status_display = "⛔ STRESSFUL"
+        else:
+            status_display = "🚫 UNSAFE"
+        
+        # Weather details
+        score_display = f"{score_emoji} {raw_score:.2f}/5"
+        weather_details = (
+            f"{weather_icon}<strong>{temp}°F</strong> | "
+            f"DewPt <strong>{dew_point}°F</strong> | "
+            f"💨{wind}mph | "
+            f"💧{humidity}% | "
+            f"🌧️{precip}% | "
+            f"{status_display}"
+        )
+        weather_line_html = (
+            f"<div style='display: flex; justify-content: space-between; align-items: center; font-weight: bold;'>"
+            f"  <span style='color: {date_color};'>{clean_date_for_line} . {time_str}</span>"
+            f"  <span style='color: {score_color};'>{score_display}</span>"
+            f"</div>"
+            f"<div style='margin-top: 6px; color: #555; font-size: 0.9em;'>{weather_details}</div>"
+        )
+
+        # Forecast conditions display
+        forecast_html = f"""
+            <div style='margin-top: 10px; padding: 10px; background: rgba(33, 150, 243, 0.1); border-left: 4px solid #2196F3; border-radius: 6px; font-size: 0.95em;'>
+                <strong>🌤️ Conditions:</strong> {forecast_str}
+            </div>
+        """
+
+        # Recommendation formatting
+        rec_points_html = ""
+        if ": " in full_recommendation:
+            parts = full_recommendation.split(": ", 1)
+            rec_points = [f"<li>{point.strip()}</li>" for point in parts[1].split(" • ")]
+            rec_points_html = f"<ul style='margin: 5px 0 0 20px; padding: 0;'>{''.join(rec_points)}</ul>"
+        else:
+            rec_points_html = f"<ul style='margin: 5px 0 0 20px; padding: 0;'><li>{full_recommendation}</li></ul>"
+        recommendation_html = f"<div style='margin-top: 12px; font-size: 0.95em;'><strong>💡 Recommendations:</strong>{rec_points_html}</div>"
+
+        # HTML block assembly
+        hour_block = (
+            f"<div style='background: {score_bg}; border-left: 5px solid {score_color}; border-radius: 8px; "
+            f"padding: 12px; margin: 10px 0; font-family: Arial, sans-serif; font-size: 15px;'>"
+            f"  {weather_line_html}"
+            f"  {forecast_html}"
+            f"  {recommendation_html}"
+            f"</div>"
+        )
+        html_parts.append(hour_block)
+
+    return "".join(html_parts)
+
+# --- Tools ---
+
+@tool
+def get_city_from_zipcode(zip_code: str) -> str:
+    """Convert a 5-digit US zip code to 'City, State' format."""
+    if not re.match(r'^\d{5}$', zip_code):
+        return zip_code
+
+    try:
+        url = f"https://api.zippopotam.us/us/{zip_code}"
+        response = requests.get(url, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        place_name = data['places'][0]['place name']
+        state_abbr = data['places'][0]['state abbreviation']
+        city_state = f"{place_name}, {state_abbr}"
+        logger.info(f"Converted zip code {zip_code} to '{city_state}'")
+        return city_state
+    except Exception as e:
+        logger.warning(f"Failed to convert zip code {zip_code}: {e}")
+        return zip_code
+
+@tool
+def get_weather_forecast_from_server(city: str, granularity: str = 'hourly') -> str:
+    """Get weather forecast from the MCP server."""
+    server_url = os.getenv("WEATHER_SERVER_URL", "http://localhost:8000/get_weather")
+    payload = {"city": city, "granularity": granularity}
+    headers = {"Content-Type": "application/json"}
+    
+    try:
+        logger.info(f"Calling Weather Server for: {city} ({granularity})")
+        response = requests.post(server_url, data=json.dumps(payload), headers=headers, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+        
+        if "forecast" in result:
+            return result["forecast"]
+        else:
+            return f"Weather data received but no forecast found for {city}"
+            
+    except requests.exceptions.Timeout:
+        return f"Timeout error: Weather server took too long to respond for {city}"
+    except requests.exceptions.ConnectionError:
+        return f"Connection error: Could not connect to weather server for {city}"
+    except requests.exceptions.RequestException as e:
+        return f"Error contacting weather server for {city}: {e}"
+    except json.JSONDecodeError:
+        return f"Error: Invalid JSON response from weather server for {city}"
+
+def schedule_daily_email_report(
+    location: str,
+    time_windows: dict,
+    recipient_email: str,
+    scheduled_time: str,
+    start_date: str,
+    end_date: str
+) -> str:
+    """Schedule a daily email report for a specific time and date range."""
+    
+    def job():
+        # Date range check
+        today = datetime.now().date()
+        start_date_obj = datetime.strptime(start_date, '%Y-%m-%d').date()
+        end_date_obj = datetime.strptime(end_date, '%Y-%m-%d').date()
+
+        if not (start_date_obj <= today <= end_date_obj):
+            logger.info(f"Skipping scheduled job for {location}. Today ({today}) is outside the range {start_date} to {end_date}.")
+            return
+        
+        logger.info(f"Running scheduled job for {location} (date range valid)")
+        try:
+            result = handle_enhanced_forecast_request(
+                city=location,
+                time_windows=time_windows,
+                form_data={
+                    'location': [location],
+                    'action': ['get_forecast'],
+                    **{f'{window}_start': [times[0]] for window, times in time_windows.items()},
+                    **{f'{window}_end': [times[1]] for window, times in time_windows.items()}
+                }
+            )
+            
+            subject = f"Your Daily Running Forecast for {location}"
+            
+            # Generate email content
+            if result.get('is_mobile') and result.get('card_data'):
+                email_content = generate_email_content_from_cards(result['card_data'], location)
+            else:
+                email_content = clean_html_for_email(result.get('final_html', ''))
+            
+            email_body = create_email_html(email_content, location)
+            send_email_notification(recipient_email, subject, email_body, is_html=True)
+            
+        except Exception as e:
+            logger.error(f"Error in scheduled job: {e}")
+
+    schedule.every().day.at(scheduled_time).do(job)
+    return f"Ã¢ÂÂ Success! Daily report for '{location}' scheduled for {scheduled_time} from {start_date} to {end_date} to '{recipient_email}'."
+
+@tool
+def get_air_quality_from_server(city: str) -> str:
+    """Get Air Quality Index forecast from the server."""
+    server_url = os.getenv("AQI_SERVER_URL", "http://localhost:8001/get_air_quality")
+    payload = {"city": city}
+    headers = {"Content-Type": "application/json"}
+    
+    try:
+        logger.info(f"Calling Air Quality Server for: {city}")
+        response = requests.post(server_url, data=json.dumps(payload), headers=headers, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+        
+        if "forecast" in result:
+            return result["forecast"]
+        else:
+            return f"Air quality data received but no forecast found for {city}"
+            
+    except requests.exceptions.Timeout:
+        return f"Timeout error: Air quality server took too long to respond for {city}"
+    except requests.exceptions.ConnectionError:
+        return f"Connection error: Could not connect to air quality server for {city}"
+    except requests.exceptions.RequestException as e:
+        return f"Error contacting air quality server for {city}: {e}"
+    except json.JSONDecodeError:
+        return f"Error: Invalid JSON response from air quality server for {city}"
+
+@tool
+def schedule_daily_email_report(
+    location: str,
+    time_windows: dict,
+    recipient_email: str,
+    scheduled_time: str,
+    start_date: str,
+    end_date: str
+) -> str:
+    """Schedule a daily email report for a specific time and date range."""
+    
+    def job():
+        # Date range check
+        today = datetime.now().date()
+        start_date_obj = datetime.strptime(start_date, '%Y-%m-%d').date()
+        end_date_obj = datetime.strptime(end_date, '%Y-%m-%d').date()
+
+        if not (start_date_obj <= today <= end_date_obj):
+            logger.info(f"Skipping scheduled job for {location}. Today ({today}) is outside the range {start_date} to {end_date}.")
+            return
+        
+        logger.info(f"Running scheduled job for {location} (date range valid)")
+        try:
+            analysis_html = run_agent_workflow(
+                form_data={
+                    'location': [location],
+                    'action': ['get_forecast'],
+                    **{f'{window}_start': [times[0]] for window, times in time_windows.items()},
+                    **{f'{window}_end': [times[1]] for window, times in time_windows.items()}
+                }
+            )
+            subject = f"Your Daily Running Forecast for {location}"
+            email_body = create_email_html(analysis_html.get('final_html', ''), location)
+            send_email_notification(recipient_email, subject, email_body, is_html=True)
+        except Exception as e:
+            logger.error(f"Error in scheduled job: {e}")
+
+    schedule.every().day.at(scheduled_time).do(job)
+    return f"Ã¢ÂÂ Success! Daily report for '{location}' scheduled for {scheduled_time} from {start_date} to {end_date} to '{recipient_email}'."
+
+#Profile Generation Functions
+
+def generate_enhanced_profile_card_data(form_data: dict) -> dict:
+    """Generate enhanced profile card data with all requested features."""
+    profile_data = {
+        'has_profile': False,
+        'plan': None,
+        'plan_type': None,
+        'week': None,
+        'today_workout': None,
+        'weekly_plan': [],
+        'nutrition': None,
+        'strength_training': None,
+        'mindfulness': None,
+        'age': None,
+        'height': None,
+        'weight': None,
+        'health_conditions': None,
+        'mobility_restrictions': None,
+        'dietary_restrictions': None,
+        'other_details': None
+    }
+    
+    # Check if any profile data exists
+    profile_fields = ['vita_avatar', 'age', 'run_plan', 'plan_period']
+    has_profile_data = any(form_data.get(field, [''])[0] for field in profile_fields)
+    
+    if not has_profile_data:
+        return profile_data
+        
+    profile_data['has_profile'] = True
+    
+    # Extract physical stats
+    age = form_data.get('age', [''])[0]
+    if age:
+        profile_data['age'] = age
+    
+    height_feet = form_data.get('height_feet', [''])[0]
+    height_inches = form_data.get('height_inches', [''])[0]
+    if height_feet and height_inches:
+        profile_data['height'] = f"{height_feet}'{height_inches}\""
+    
+    weight = form_data.get('weight', [''])[0]
+    if weight:
+        profile_data['weight'] = f"{weight} lbs"
+
+    # Extract plan information - show plan type rather than higher level plan
+    run_plan = form_data.get('run_plan', [''])[0]
+    plan_type = form_data.get('plan_type', [''])[0]
+    plan_period = form_data.get('plan_period', [''])[0]
+    
+    if run_plan and plan_period:
+        plan_names = {
+            'daily_fitness': 'Daily Fitness Running',
+            'fitness_goal': 'Fitness Goal Training', 
+            'athletic_goal': 'Athletic Achievement Training'
+        }
+        
+        plan_type_names = {
+            'individual': 'Individual',
+            'group': 'Group (Family/Friends)'
+        }
+        
+        # Use unified plan type for display if available, otherwise fallback to original logic
+        unified_plan_type = form_data.get('unified_plan_type', [''])[0]
+        
+        if unified_plan_type:
+            # Create display-friendly names for unified plan types
+            unified_display_names = {
+                # Daily Fitness
+                'individual_daily': 'Individual Daily Fitness',
+                'group_daily': 'Group Daily Fitness',
+                # Fitness Goals
+                'starting_fitness': 'Just Starting - Build Base Fitness',
+                'weight_loss_fitness': 'Weight Loss Focus', 
+                'endurance_fitness': 'Improve Endurance',
+                # Athletic Goals
+                'hm_300': '3:00 Hr Half Marathon',
+                'hm_230': '2:30 Hr Half Marathon',
+                'hm_200': '2:00 Hr Half Marathon', 
+                'hm_130': '1:30 Hr Half Marathon',
+                'm_530': '5:30 Hr Marathon',
+                'm_500': '5:00 Hr Marathon',
+                'm_430': '4:30 Hr Marathon',
+                'm_400': '4:00 Hr Marathon'
+            }
+            profile_data['plan'] = unified_display_names.get(unified_plan_type, unified_plan_type)
+            profile_data['plan_type'] = None  # Not needed with unified display
+        else:
+            # Fallback to original logic for backward compatibility
+            profile_data['plan'] = plan_names.get(run_plan, run_plan)
+            profile_data['plan_type'] = plan_type_names.get(plan_type, plan_type) if plan_type else None
+        
+        # Determine total plan duration based on goal type (same logic as llm_prompts.py)
+        # Determine total plan duration based on selected week
+    plan_duration_weeks = 12  # Default duration
+    current_week_num = 1  # Always start at Week 1
+    
+    if plan_period:
+        # The selected week number indicates the TOTAL plan duration
+        # User selected Week 12 = 12-week plan, starting at Week 1
+        selected_week = plan_period.replace('week_', '')
+        plan_duration_weeks = int(selected_week)
+        current_week_num = 1  # Always start at Week 1
+    
+    # Format week display as "Week 1 of X"
+    profile_data['week'] = f"Week {current_week_num} of {plan_duration_weeks}"
+    
+    # Add individual week tracking for scrollable view
+    profile_data['current_week'] = current_week_num
+    profile_data['total_weeks'] = plan_duration_weeks
+        
+        # Generate today's workout that matches weekly plan
+    profile_data['today_workout'] = generate_todays_detailed_workout(run_plan, plan_period, form_data)
+    profile_data['weekly_plan'] = generate_matching_weekly_plan(run_plan, plan_type)
+        
+        # Generate all weeks for scrollable view
+    profile_data['all_weeks_plan'] = generate_all_weeks_plan(run_plan, plan_type, plan_duration_weeks, current_week_num)
+    
+    # Add wellness components only if user selected them
+    show_nutrition = form_data.get('show_nutrition', [''])[0]
+    if show_nutrition == 'yes':
+        profile_data['nutrition'] = generate_enhanced_nutrition_plan(form_data)
+    
+    strength_training = form_data.get('strength_training', [''])[0]
+    if strength_training == 'yes':
+        profile_data['strength_training'] = generate_detailed_strength_plan()
+    
+    mindfulness_plan = form_data.get('mindfulness_plan', [''])[0]
+    if mindfulness_plan == 'yes':
+        profile_data['mindfulness'] = generate_detailed_mindfulness_plan()
+    
+    # Extract health and dietary information
+    health_conditions = form_data.get('health_conditions', [''])[0]
+    if health_conditions:
+        profile_data['health_conditions'] = health_conditions
+    
+    mobility_restrictions = form_data.get('mobility_restrictions', [''])[0]
+    if mobility_restrictions:
+        profile_data['mobility_restrictions'] = mobility_restrictions
+    
+    dietary_restrictions = form_data.get('dietary_restrictions', [''])[0]
+    if dietary_restrictions:
+        profile_data['dietary_restrictions'] = dietary_restrictions
+    
+    other_details = form_data.get('other_details', [''])[0]
+    if other_details:
+        profile_data['other_details'] = other_details
+    
+    return profile_data
+
+#Core Data Generation Functions
+
+def generate_full_strength_training_plan() -> str:
+    """Generate comprehensive strength training plan for desktop view."""
+    
+    html = """
+        <h4>Complete Strength Training Program</h4>
+        
+        <h5>Program Overview</h5>
+        <div style="background: #fff3e0; padding: 15px; border-radius: 8px; margin: 15px 0;">
+            <p><strong>Frequency:</strong> 2-3 sessions per week (Tuesday, Friday, and optional Sunday)</p>
+            <p><strong>Duration:</strong> 45-60 minutes per session</p>
+            <p><strong>Focus:</strong> Running-specific strength, injury prevention, and power development</p>
+            <p><strong>Progression:</strong> Increase resistance or repetitions weekly</p>
+        </div>
+        
+        <h5>Session A: Lower Body Focus (Tuesday)</h5>
+        <div style="overflow-x: auto;">
+            <table style="width: 100%; border-collapse: collapse; margin: 15px 0;">
+                <thead>
+                    <tr style="background: #e9ecef;">
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Exercise</th>
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Sets</th>
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Reps</th>
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Purpose</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr><td style="padding: 10px; border: 1px solid #ddd;">Squats (bodyweight or weighted)</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">3</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">12-15</td><td style="padding: 10px; border: 1px solid #ddd;">Quad/glute strength, running power</td></tr>
+                    <tr><td style="padding: 10px; border: 1px solid #ddd;">Single-leg deadlifts</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">3</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">8-10 each</td><td style="padding: 10px; border: 1px solid #ddd;">Hamstring strength, balance, stability</td></tr>
+                    <tr><td style="padding: 10px; border: 1px solid #ddd;">Lunges (forward/reverse)</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">3</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">10 each leg</td><td style="padding: 10px; border: 1px solid #ddd;">Functional leg strength</td></tr>
+                    <tr><td style="padding: 10px; border: 1px solid #ddd;">Glute bridges</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">3</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">15-20</td><td style="padding: 10px; border: 1px solid #ddd;">Glute activation, hip stability</td></tr>
+                    <tr><td style="padding: 10px; border: 1px solid #ddd;">Calf raises (single leg)</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">3</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">15 each</td><td style="padding: 10px; border: 1px solid #ddd;">Lower leg strength, push-off power</td></tr>
+                    <tr><td style="padding: 10px; border: 1px solid #ddd;">Step-ups</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">3</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">10 each leg</td><td style="padding: 10px; border: 1px solid #ddd;">Running-specific movement pattern</td></tr>
+                </tbody>
+            </table>
+        </div>
+        
+        <h5>Session B: Core & Upper Body Focus (Friday)</h5>
+        <div style="overflow-x: auto;">
+            <table style="width: 100%; border-collapse: collapse; margin: 15px 0;">
+                <thead>
+                    <tr style="background: #e9ecef;">
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Exercise</th>
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Sets</th>
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Duration/Reps</th>
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Purpose</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr><td style="padding: 10px; border: 1px solid #ddd;">Planks (front/side)</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">3</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">30-60 sec</td><td style="padding: 10px; border: 1px solid #ddd;">Core stability, running posture</td></tr>
+                    <tr><td style="padding: 10px; border: 1px solid #ddd;">Dead bugs</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">3</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">10 each side</td><td style="padding: 10px; border: 1px solid #ddd;">Deep core stability</td></tr>
+                    <tr><td style="padding: 10px; border: 1px solid #ddd;">Bird dogs</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">3</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">8-10 each</td><td style="padding: 10px; border: 1px solid #ddd;">Spinal stability, coordination</td></tr>
+                    <tr><td style="padding: 10px; border: 1px solid #ddd;">Push-ups (modified if needed)</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">3</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">8-15</td><td style="padding: 10px; border: 1px solid #ddd;">Upper body strength, arm drive</td></tr>
+                    <tr><td style="padding: 10px; border: 1px solid #ddd;">Rows (resistance band/weights)</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">3</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">12-15</td><td style="padding: 10px; border: 1px solid #ddd;">Posterior chain, posture</td></tr>
+                    <tr><td style="padding: 10px; border: 1px solid #ddd;">Russian twists</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">3</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;">20 total</td><td style="padding: 10px; border: 1px solid #ddd;">Rotational core strength</td></tr>
+                </tbody>
+            </table>
+        </div>
+        
+        <h5>Optional Session C: Power & Plyometrics (Sunday)</h5>
+        <div style="background: #e8f5e9; padding: 15px; border-radius: 8px; margin: 15px 0;">
+            <p><strong>Focus:</strong> Explosive power for improved running economy</p>
+            <ul style="margin: 10px 0; padding-left: 20px;">
+                <li><strong>Box jumps:</strong> 3 sets of 5-8 reps</li>
+                <li><strong>Broad jumps:</strong> 3 sets of 5 jumps</li>
+                <li><strong>Lateral bounds:</strong> 3 sets of 8 each direction</li>
+                <li><strong>Single-leg hops:</strong> 3 sets of 6 each leg</li>
+                <li><strong>Skipping drills:</strong> 3 sets of 30 seconds</li>
+            </ul>
+            <p><em>Note: Only perform plyometrics when feeling fresh and with proper form</em></p>
+        </div>
+        
+        <h5>Injury Prevention Focus Areas</h5>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin: 15px 0;">
+            <div style="background: #fff8e1; padding: 15px; border-radius: 8px;">
+                <h6 style="color: #f57c00; margin-top: 0;">Hip Stability</h6>
+                <ul style="margin: 0; padding-left: 20px; font-size: 14px;">
+                    <li>Clamshells with resistance band</li>
+                    <li>Side-lying leg lifts</li>
+                    <li>Monster walks with band</li>
+                    <li>Single-leg glute bridges</li>
+                </ul>
+            </div>
+            <div style="background: #f3e5f5; padding: 15px; border-radius: 8px;">
+                <h6 style="color: #7b1fa2; margin-top: 0;">Ankle Mobility</h6>
+                <ul style="margin: 0; padding-left: 20px; font-size: 14px;">
+                    <li>Calf stretches (straight and bent leg)</li>
+                    <li>Ankle circles and flexion</li>
+                    <li>Toe walks and heel walks</li>
+                    <li>Balance exercises on one foot</li>
+                </ul>
+            </div>
+        </div>
+        
+        <h5>Progression Guidelines</h5>
+        <div style="background: #e1f5fe; padding: 15px; border-radius: 8px; margin: 15px 0;">
+            <ul style="margin: 0; padding-left: 20px;">
+                <li><strong>Week 1-2:</strong> Focus on form and movement quality</li>
+                <li><strong>Week 3-4:</strong> Increase repetitions by 2-3 per set</li>
+                <li><strong>Week 5-6:</strong> Add resistance or progress to harder variations</li>
+                <li><strong>Week 7-8:</strong> Increase sets or add new exercises</li>
+                <li><strong>Recovery:</strong> Take a deload week every 4-6 weeks</li>
+            </ul>
+        </div>
+    """
+    
+    return html
+
+def generate_full_mindfulness_plan() -> str:
+    """Generate comprehensive mindfulness plan for desktop view."""
+    
+    html = """
+        <h4>Complete Mindfulness & Mental Training Program</h4>
+        
+        <h5>Program Philosophy</h5>
+        <div style="background: #f3e5f5; padding: 15px; border-radius: 8px; margin: 15px 0;">
+            <p>This program integrates mindfulness practices with running training to enhance mental resilience, focus, and overall well-being. The practices are designed to complement your physical training and can significantly improve both performance and enjoyment of running.</p>
+        </div>
+        
+        <h5>Daily Mindfulness Practice Schedule</h5>
+        <div style="overflow-x: auto;">
+            <table style="width: 100%; border-collapse: collapse; margin: 15px 0;">
+                <thead>
+                    <tr style="background: #e9ecef;">
+                        <th style="padding: 12px; border: 1px solid #ddd; text-align: left;">Time of Day</th>
+                        <th style="padding: 12px; border: 1px solid #ddd; text-align: left;">Practice</th>
+                        <th style="padding: 12px; border: 1px solid #ddd; text-align: center;">Duration</th>
+                        <th style="padding: 12px; border: 1px solid #ddd; text-align: left;">Purpose</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td style="padding: 12px; border: 1px solid #ddd;"><strong>Morning (upon waking)</strong></td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Breathing awareness meditation</td>
+                        <td style="padding: 12px; border: 1px solid #ddd; text-align: center;">10-15 min</td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Set intention, calm mind for the day</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 12px; border: 1px solid #ddd;"><strong>Pre-run</strong></td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Body scan and intention setting</td>
+                        <td style="padding: 12px; border: 1px solid #ddd; text-align: center;">3-5 min</td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Connect with body, set running intention</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 12px; border: 1px solid #ddd;"><strong>During run</strong></td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Mindful running techniques</td>
+                        <td style="padding: 12px; border: 1px solid #ddd; text-align: center;">Ongoing</td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Present moment awareness, rhythm focus</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 12px; border: 1px solid #ddd;"><strong>Post-run</strong></td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Gratitude reflection</td>
+                        <td style="padding: 12px; border: 1px solid #ddd; text-align: center;">2-3 min</td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Appreciation, positive reinforcement</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 12px; border: 1px solid #ddd;"><strong>Evening</strong></td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Progressive muscle relaxation</td>
+                        <td style="padding: 12px; border: 1px solid #ddd; text-align: center;">10-15 min</td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Recovery, stress relief, better sleep</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        
+        <h5>Mindful Running Techniques</h5>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin: 15px 0;">
+            <div style="background: #e8f5e9; padding: 15px; border-radius: 8px;">
+                <h6 style="color: #2e7d32; margin-top: 0;">Breath Awareness</h6>
+                <ul style="margin: 0; padding-left: 20px; font-size: 14px;">
+                    <li>Focus on natural breathing rhythm</li>
+                    <li>Count breath cycles (inhale-exhale = 1)</li>
+                    <li>Match breathing to footsteps</li>
+                    <li>Notice breath quality changes with effort</li>
+                </ul>
+            </div>
+            <div style="background: #fff3e0; padding: 15px; border-radius: 8px;">
+                <h6 style="color: #f57c00; margin-top: 0;">Body Awareness</h6>
+                <ul style="margin: 0; padding-left: 20px; font-size: 14px;">
+                    <li>Scan body from head to toe while running</li>
+                    <li>Notice areas of tension or ease</li>
+                    <li>Feel foot strike patterns</li>
+                    <li>Observe arm swing and posture</li>
+                </ul>
+            </div>
+            <div style="background: #e1f5fe; padding: 15px; border-radius: 8px;">
+                <h6 style="color: #0277bd; margin-top: 0;">Environmental Awareness</h6>
+                <ul style="margin: 0; padding-left: 20px; font-size: 14px;">
+                    <li>Notice sounds, sights, and smells</li>
+                    <li>Feel temperature and air movement</li>
+                    <li>Appreciate natural surroundings</li>
+                    <li>Use landmarks as mindfulness cues</li>
+                </ul>
+            </div>
+            <div style="background: #fce4ec; padding: 15px; border-radius: 8px;">
+                <h6 style="color: #c2185b; margin-top: 0;">Mental Strategies</h6>
+                <ul style="margin: 0; padding-left: 20px; font-size: 14px;">
+                    <li>Positive self-talk and affirmations</li>
+                    <li>Visualization of goals and success</li>
+                    <li>Acceptance of challenging moments</li>
+                    <li>Present moment return techniques</li>
+                </ul>
+            </div>
+        </div>
+        
+        <h5>Weekly Meditation Progression</h5>
+        <div style="background: #f8bbd9; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 15px; border-radius: 8px; margin: 15px 0;">
+            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; text-align: center;">
+                <div>
+                    <h6 style="margin: 0 0 8px 0;">Week 1-2</h6>
+                    <p style="margin: 0; font-size: 13px;">Basic breath awareness<br>5-10 minutes daily</p>
+                </div>
+                <div>
+                    <h6 style="margin: 0 0 8px 0;">Week 3-4</h6>
+                    <p style="margin: 0; font-size: 13px;">Body scan meditation<br>10-15 minutes daily</p>
+                </div>
+                <div>
+                    <h6 style="margin: 0 0 8px 0;">Week 5-6</h6>
+                    <p style="margin: 0; font-size: 13px;">Walking meditation<br>15-20 minutes daily</p>
+                </div>
+                <div>
+                    <h6 style="margin: 0 0 8px 0;">Week 7+</h6>
+                    <p style="margin: 0; font-size: 13px;">Integrated practice<br>20+ minutes daily</p>
+                </div>
+            </div>
+        </div>
+        
+        <h5>Stress Management Techniques</h5>
+        <div style="background: #fff8e1; padding: 15px; border-radius: 8px; margin: 15px 0;">
+            <h6 style="color: #f57c00; margin-top: 0;">4-7-8 Breathing Technique</h6>
+            <p style="margin: 5px 0;">For anxiety or pre-race nerves:</p>
+            <ol style="margin: 0; padding-left: 25px;">
+                <li>Inhale through nose for 4 counts</li>
+                <li>Hold breath for 7 counts</li>
+                <li>Exhale through mouth for 8 counts</li>
+                <li>Repeat 3-4 times</li>
+            </ol>
+            
+            <h6 style="color: #f57c00; margin: 15px 0 5px 0;">Progressive Muscle Relaxation</h6>
+            <p style="margin: 5px 0;">For post-run recovery and better sleep:</p>
+            <ol style="margin: 0; padding-left: 25px;">
+                <li>Start with toes, tense for 5 seconds, then release</li>
+                <li>Work systematically up through each muscle group</li>
+                <li>Notice the contrast between tension and relaxation</li>
+                <li>End with full-body relaxation for 2-3 minutes</li>
+            </ol>
+        </div>
+        
+        <h5>Race Day Mental Preparation</h5>
+        <div style="background: #e8eaf6; padding: 15px; border-radius: 8px; margin: 15px 0;">
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                <div>
+                    <h6 style="color: #3f51b5; margin-top: 0;">Pre-Race Routine</h6>
+                    <ul style="margin: 0; padding-left: 20px; font-size: 14px;">
+                        <li>5-minute calming meditation</li>
+                        <li>Positive visualization of race</li>
+                        <li>Intention setting and goal reminder</li>
+                        <li>Gratitude for training and opportunity</li>
+                    </ul>
+                </div>
+                <div>
+                    <h6 style="color: #3f51b5; margin-top: 0;">During-Race Mantras</h6>
+                    <ul style="margin: 0; padding-left: 20px; font-size: 14px;">
+                        <li>"Strong, smooth, steady"</li>
+                        <li>"I am exactly where I need to be"</li>
+                        <li>"One step at a time"</li>
+                        <li>"I choose to embrace this challenge"</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    """
+    
+    return html
+
+# Update the main handle_forecast_request function to include full desktop plans
+def handle_enhanced_desktop_forecast_request(city: str, time_windows: dict, form_data: dict) -> dict:
+    """Enhanced forecast request with complete desktop training plans."""
+    try:
+        # Existing weather processing code
+        weather_response = get_weather_forecast_from_server.invoke({"city": city, "granularity": "hourly"})
+        aqi_data = get_air_quality_from_server.invoke({"city": city})
+        
+        weather_data = parse_weather_data(weather_response)
+        today_data = weather_data.get('today', [])
+        tomorrow_data = weather_data.get('tomorrow', [])
+
+        all_scored_hours = []
+        seen_hours = set()
+
+        def time_to_hour(time_str): 
+            return int(time_str.split(':')[0])
+
+        for window_key, times in time_windows.items():
+            start_hour, end_hour = time_to_hour(times[0]), time_to_hour(times[1])
+            data_source = today_data if 'today' in window_key else tomorrow_data
+            
+            filtered = [h for h in data_source if h['HourNum'] != "N/A" and start_hour <= h['HourNum'] <= end_hour]
+            
+            today_aqi_match = re.search(r'\b(\d{1,3})\b', aqi_data)
+            today_aqi = int(today_aqi_match.group(1)) if today_aqi_match else "N/A"
+
+            scored = [score_hour_with_scientific_approach(h, aqi_value=today_aqi) for h in filtered]
+            
+            for hour in scored:
+                hour_key = (hour.get('day_category'), hour.get('HourNum'))
+                if hour_key not in seen_hours:
+                    all_scored_hours.append(hour)
+                    seen_hours.add(hour_key)
+
+        if not all_scored_hours:
+            return {
+                'final_html': f"<div style='color: #F44336;'>No data available for the selected time windows in {city}.</div>",
+                'final_user_message': f'No forecast data available for {city}.'
+            }
+
+        all_scored_hours.sort(key=lambda x: (x.get('day_category', 'z'), x.get('HourNum', 0)))
+        
+        is_mobile_request = form_data.get('mobile_view', ['false'])[0] == 'true'
+        
+        if is_mobile_request:
+            card_data = generate_enhanced_card_data(all_scored_hours, city, form_data)
+            mobile_html = generate_mobile_card_html(card_data)
+            
+            return {
+                'final_html': mobile_html,
+                'final_user_message': f'Enhanced mobile forecast generated for {city}.',
+                'is_mobile': True,
+                'card_data': card_data
+            }
+        else:
+            # Generate complete desktop view with full training plans
+            full_training_plan = ""
+            
+            # Check if any profile data exists
+            if any(form_data.get(key, [''])[0] for key in ['vita_avatar', 'age', 'run_plan']):
+                try:
+                    # Generate the complete training plan HTML
+                    full_training_plan = generate_full_desktop_training_plan(form_data)
+                    
+                    # If plan_display is 'full_plan', ensure we show EVERYTHING
+                    plan_display = form_data.get('plan_display', [''])[0]
+                    if plan_display == 'full_plan':
+                        # Add the LLM-based personalized summary
+                        runner_profile_prompt = format_runner_profile_prompt(form_data)
+                        llm_plan = get_llm_run_plan_summary(runner_profile_prompt)
+                        
+                        full_training_plan = f"""
+                            <div style="margin: 20px 0; padding: 20px; background: #f8f9fa; border-radius: 8px; border-left: 4px solid #007bff;">
+                                <h3 style="color: #007bff; margin-top: 0;">Your Personalized Training Program</h3>
+                                {llm_plan}
+                            </div>
+                            {full_training_plan}
+                        """
+                    
+                except Exception as e:
+                    logger.error(f"Error generating full training plan: {e}")
+
+            forecast_html = generate_compact_html_analysis(all_scored_hours, city)
+            
+            return {
+                'final_html': full_training_plan + forecast_html,
+                'final_user_message': f'Complete forecast and training plan generated for {city}.',
+                'is_mobile': False
+            }
+
+    except Exception as e:
+        logger.error(f"Error in enhanced desktop forecast request: {e}")
+        return {
+            'final_html': f'<div style="color: red;">Error generating forecast: {str(e)}</div>',
+            'final_user_message': f'Error generating forecast: {str(e)}'
+        }
+
+def generate_full_desktop_training_plan(form_data: dict) -> str:
+    """Generate comprehensive training plan for desktop view."""
+    
+    # Extract form data
+    run_plan = form_data.get('run_plan', [''])[0]
+    plan_type = form_data.get('plan_type', [''])[0]
+    plan_display = form_data.get('plan_display', [''])[0]
+    plan_period = form_data.get('plan_period', [''])[0]
+    show_nutrition = form_data.get('show_nutrition', [''])[0]
+    strength_training = form_data.get('strength_training', [''])[0]
+    mindfulness_plan = form_data.get('mindfulness_plan', [''])[0]
+    
+    if not run_plan:
+        return ""
+    
+    html_parts = []
+    
+    # Training Plan Header
+    plan_names = {
+        'daily_fitness': 'Daily Fitness Running Program',
+        'fitness_goal': 'Fitness Goal Training Program',
+        'athletic_goal': 'Athletic Achievement Program'
+    }
+    
+    plan_type_text = ""
+    if plan_type:
+        plan_type_names = {
+            'individual': 'Individual Training',
+            'group': 'Group/Family Training'
+        }
+        plan_type_text = f" - {plan_type_names.get(plan_type, plan_type)}"
+    
+    week_text = ""
+    if plan_period:
+        week_num = plan_period.replace('week_', '')
+        week_text = f" (Week {week_num})"
+    
+    html_parts.append(f"""
+        <div style="margin: 20px 0; padding: 20px; background: #f8f9fa; border-radius: 8px; border-left: 4px solid #007bff;">
+            <h3 style="color: #007bff; margin-top: 0;">{plan_names.get(run_plan, run_plan)}{plan_type_text}{week_text}</h3>
+    """)
+    
+    # Generate training schedule based on plan display option
+    if plan_display == 'full_plan':
+        html_parts.append(generate_full_multi_week_plan(run_plan, plan_type, plan_period))
+    elif plan_display == 'one_day':
+        html_parts.append(generate_single_day_plan(run_plan, plan_period, form_data))
+    elif plan_display == 'this_week':
+        html_parts.append(generate_this_week_plan(run_plan, plan_type, plan_period))
+    
+    html_parts.append("</div>")
+    
+    # ALWAYS add nutrition plan if selected (regardless of plan_display)
+    if show_nutrition == 'yes':
+        html_parts.append("""
+        <div style="margin: 20px 0; padding: 20px; background: linear-gradient(135deg, rgba(232, 245, 233, 0.9), rgba(200, 230, 201, 0.8)); border-radius: 8px; border: 3px solid #4CAF50; box-shadow: 0 4px 12px rgba(76, 175, 80, 0.2); position: relative;">
+            <div style="position: absolute; top: 12px; right: 18px; font-size: 50px; opacity: 0.7; filter: drop-shadow(3px 3px 6px rgba(76, 175, 80, 0.4)); transform: rotate(-8deg);">🌅ÂÂ¥Â</div>
+    """)
+        html_parts.append(generate_full_nutrition_plan(form_data))
+        html_parts.append("</div>")    # ALWAYS add strength training plan if selected
+    if strength_training == 'yes':
+        html_parts.append("""
+            <div style="margin: 20px 0; padding: 20px; background: linear-gradient(135deg, rgba(255, 243, 224, 0.9), rgba(255, 224, 178, 0.8)); border-radius: 8px; border: 3px solid #FF9800; box-shadow: 0 4px 12px rgba(255, 152, 0, 0.2); position: relative;">
+                <div style="position: absolute; top: 12px; right: 18px; font-size: 50px; opacity: 0.7; filter: drop-shadow(3px 3px 6px rgba(255, 152, 0, 0.4)); transform: rotate(12deg);">ÃÂ°ÃÂ¸ÃÂÃ¢ÂÂ¹ÃÂ¯ÃÂ¸ÃÂÃÂ¢Ã¢ÂÂ¬ÃÂÃÂ¢Ã¢ÂÂ¢Ã¢ÂÂ¬ÃÂ¯ÃÂ¸ÃÂ</div>
+        """)
+        html_parts.append(generate_full_strength_training_plan())
+        html_parts.append("</div>")
+    
+    # ALWAYS add mindfulness plan if selected
+    if mindfulness_plan == 'yes':
+        html_parts.append("""
+            <div style="margin: 20px 0; padding: 20px; background: linear-gradient(135deg, rgba(243, 229, 245, 0.9), rgba(225, 190, 231, 0.8)); border-radius: 8px; border: 3px solid #9C27B0; box-shadow: 0 4px 12px rgba(156, 39, 176, 0.2); position: relative;">
+                <div style="position: absolute; top: 12px; right: 18px; font-size: 50px; opacity: 0.7; filter: drop-shadow(3px 3px 6px rgba(156, 39, 176, 0.4)); animation: pulse 4s ease-in-out infinite;">ð§ÃÂ¢Ã¢ÂÂ¬ÃÂÃÂ¢Ã¢ÂÂ¢Ã¢ÂÂ¬ÃÂ¯ÃÂ¸ÃÂ</div>
+        """)
+        html_parts.append(generate_full_mindfulness_plan())
+        html_parts.append("</div>")
+    
+    return "".join(html_parts)
+
+def generate_full_multi_week_plan(run_plan: str, plan_type: str, plan_period: str) -> str:
+    """Generate complete multi-week training plan."""
+    
+    current_week = int(plan_period.replace('week_', '')) if plan_period else 1
+    
+    base_plans = {
+        'daily_fitness': {
+            'description': 'A progressive 20-week program designed to build aerobic fitness and running endurance safely.',
+            'weekly_structure': [
+                {'week': 1, 'miles': 12, 'long_run': 4, 'tempo': 2, 'easy': 6},
+                {'week': 2, 'miles': 14, 'long_run': 5, 'tempo': 3, 'easy': 6},
+                {'week': 3, 'miles': 16, 'long_run': 6, 'tempo': 3, 'easy': 7},
+                {'week': 4, 'miles': 12, 'long_run': 4, 'tempo': 2, 'easy': 6},  # Recovery week
+                {'week': 5, 'miles': 18, 'long_run': 7, 'tempo': 4, 'easy': 7},
+                {'week': 6, 'miles': 20, 'long_run': 8, 'tempo': 4, 'easy': 8},
+                {'week': 7, 'miles': 22, 'long_run': 9, 'tempo': 5, 'easy': 8},
+                {'week': 8, 'miles': 16, 'long_run': 6, 'tempo': 3, 'easy': 7},  # Recovery week
+            ]
+        },
+        'fitness_goal': {
+            'description': 'A structured program focusing on specific fitness improvements including weight management and endurance building.',
+            'weekly_structure': [
+                {'week': 1, 'miles': 15, 'long_run': 5, 'tempo': 3, 'intervals': 2, 'easy': 5},
+                {'week': 2, 'miles': 17, 'long_run': 6, 'tempo': 4, 'intervals': 2, 'easy': 5},
+                {'week': 3, 'miles': 19, 'long_run': 7, 'tempo': 4, 'intervals': 3, 'easy': 5},
+                {'week': 4, 'miles': 14, 'long_run': 5, 'tempo': 3, 'intervals': 2, 'easy': 4},
+                {'week': 5, 'miles': 21, 'long_run': 8, 'tempo': 5, 'intervals': 3, 'easy': 5},
+                {'week': 6, 'miles': 23, 'long_run': 9, 'tempo': 5, 'intervals': 4, 'easy': 5},
+                {'week': 7, 'miles': 25, 'long_run': 10, 'tempo': 6, 'intervals': 4, 'easy': 5},
+                {'week': 8, 'miles': 18, 'long_run': 7, 'tempo': 4, 'intervals': 2, 'easy': 5},
+            ]
+        },
+        'athletic_goal': {
+            'description': 'Advanced training program for competitive runners targeting specific race times and performance goals.',
+            'weekly_structure': [
+                {'week': 1, 'miles': 25, 'long_run': 8, 'tempo': 5, 'intervals': 4, 'easy': 8},
+                {'week': 2, 'miles': 28, 'long_run': 10, 'tempo': 6, 'intervals': 4, 'easy': 8},
+                {'week': 3, 'miles': 31, 'long_run': 12, 'tempo': 6, 'intervals': 5, 'easy': 8},
+                {'week': 4, 'miles': 22, 'long_run': 8, 'tempo': 4, 'intervals': 3, 'easy': 7},
+                {'week': 5, 'miles': 34, 'long_run': 14, 'tempo': 7, 'intervals': 5, 'easy': 8},
+                {'week': 6, 'miles': 37, 'long_run': 16, 'tempo': 7, 'intervals': 6, 'easy': 8},
+                {'week': 7, 'miles': 40, 'long_run': 18, 'tempo': 8, 'intervals': 6, 'easy': 8},
+                {'week': 8, 'miles': 28, 'long_run': 12, 'tempo': 5, 'intervals': 4, 'easy': 7},
+            ]
+        }
+    }
+    
+    plan_data = base_plans.get(run_plan, base_plans['daily_fitness'])
+    
+    html = f"""
+        <h4>Program Overview</h4>
+        <p>{plan_data['description']}</p>
+        
+        <h4>Weekly Training Structure</h4>
+        <div style="overflow-x: auto;">
+            <table style="width: 100%; border-collapse: collapse; margin: 15px 0;">
+                <thead>
+                    <tr style="background: #e9ecef;">
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Week</th>
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Total Miles</th>
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Long Run</th>
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Tempo</th>
+                        {"<th style='padding: 10px; border: 1px solid #ddd; text-align: center;'>Intervals</th>" if run_plan != 'daily_fitness' else ""}
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Easy Miles</th>
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+    """
+    
+    for week_data in plan_data['weekly_structure']:
+        week_num = week_data['week']
+        status = "Ã¢ÂÂ Completed" if week_num < current_week else ("ð Current" if week_num == current_week else "â³ Upcoming")
+        row_style = "background: #d4edda;" if week_num == current_week else ""
+        
+        html += f"""
+            <tr style="{row_style}">
+                <td style="padding: 10px; border: 1px solid #ddd; font-weight: bold;">Week {week_num}</td>
+                <td style="padding: 10px; border: 1px solid #ddd; text-align: center;">{week_data['miles']}</td>
+                <td style="padding: 10px; border: 1px solid #ddd; text-align: center;">{week_data['long_run']} miles</td>
+                <td style="padding: 10px; border: 1px solid #ddd; text-align: center;">{week_data['tempo']} miles</td>
+                {"<td style='padding: 10px; border: 1px solid #ddd; text-align: center;'>" + str(week_data.get('intervals', 0)) + " miles</td>" if run_plan != 'daily_fitness' else ""}
+                <td style="padding: 10px; border: 1px solid #ddd; text-align: center;">{week_data['easy']} miles</td>
+                <td style="padding: 10px; border: 1px solid #ddd; text-align: center;">{status}</td>
+            </tr>
+        """
+    
+    html += """
+                </tbody>
+            </table>
+        </div>
+        
+        <h4>Weekly Schedule Template</h4>
+    """
+    
+    html += generate_weekly_schedule_template(run_plan, plan_type)
+    
+    return html
+
+def generate_single_day_plan(run_plan: str, plan_period: str, form_data: dict) -> str:
+    """Generate detailed single day workout plan."""
+    from datetime import datetime
+    
+    today = datetime.now()
+    day_name = today.strftime('%A')
+    week_num = int(plan_period.replace('week_', '')) if plan_period else 1
+    
+    # Get today's specific workout
+    workout_plans = {
+        'daily_fitness': {
+            'Monday': f'Rest Day - Active recovery with 20-30 minutes of gentle stretching or light walking',
+            'Tuesday': f'Base Building Run - {3 + (week_num // 4)} miles at easy, conversational pace (65-75% max HR)',
+            'Wednesday': f'Tempo Run - Warm-up 1 mile easy, {2 + (week_num // 3)} miles at comfortably hard pace (80-85% max HR), cool-down 1 mile easy',
+            'Thursday': f'Recovery Run - {2 + (week_num // 6)} miles at very easy pace (60-70% max HR), focus on form',
+            'Friday': f'Rest Day - Complete rest or yoga/stretching session',
+            'Saturday': f'Long Run - {5 + week_num} miles at easy-moderate pace (70-80% max HR), negative split encouraged',
+            'Sunday': f'Cross Training - 30-45 minutes of cycling, swimming, or other low-impact cardio'
+        }
+    }
+    
+    today_workout = workout_plans.get(run_plan, workout_plans['daily_fitness']).get(day_name, 'Easy run')
+    
+    html = f"""
+        <h4>Today's Detailed Workout - {day_name}</h4>
+        <div style="background: #e3f2fd; padding: 15px; border-radius: 8px; margin: 10px 0;">
+            <h5 style="color: #1976d2; margin-top: 0;">{today_workout.split(' - ')[0]}</h5>
+            <p style="font-size: 16px; margin: 10px 0;"><strong>Instructions:</strong> {today_workout.split(' - ', 1)[1] if ' - ' in today_workout else today_workout}</p>
+        </div>
+        
+        <h5>Pre-Workout Preparation</h5>
+        <ul>
+            <li>Dynamic warm-up: 5-10 minutes of light movement and stretching</li>
+            <li>Hydration: 16-20oz of water 2-3 hours before workout</li>
+            <li>Fuel: Light snack 30-60 minutes before if needed</li>
+        </ul>
+        
+        <h5>During Workout</h5>
+        <ul>
+            <li>Monitor effort level and adjust based on how you feel</li>
+            <li>Stay hydrated: water every 15-20 minutes on longer runs</li>
+            <li>Focus on proper running form and breathing rhythm</li>
+        </ul>
+        
+        <h5>Post-Workout Recovery</h5>
+        <ul>
+            <li>Cool-down walk: 5-10 minutes of gradual pace reduction</li>
+            <li>Static stretching: 10-15 minutes focusing on major muscle groups</li>
+            <li>Refuel within 30 minutes: combination of carbs and protein</li>
+            <li>Continue hydration throughout the day</li>
+        </ul>
+    """
+    
+    return html
+
+def generate_this_week_plan(run_plan: str, plan_type: str, plan_period: str) -> str:
+    """Generate detailed plan for current week."""
+    from datetime import datetime, timedelta
+    
+    today = datetime.now()
+    week_start = today - timedelta(days=today.weekday())  # Monday of current week
+    
+    week_num = int(plan_period.replace('week_', '')) if plan_period else 1
+    
+    html = f"""
+        <h4>This Week's Training Schedule</h4>
+        <p><strong>Week {week_num}</strong> - {week_start.strftime('%B %d')} to {(week_start + timedelta(days=6)).strftime('%B %d, %Y')}</p>
+    """
+    
+    # Generate daily workouts for the week
+    daily_workouts = generate_weekly_workouts(run_plan, week_num, plan_type)
+    
+    html += '<div style="display: grid; gap: 10px; margin: 15px 0;">'
+    
+    for i, (day, workout) in enumerate(daily_workouts.items()):
+        date_obj = week_start + timedelta(days=i)
+        is_today = date_obj.date() == today.date()
+        is_past = date_obj.date() < today.date()
+        
+        status_style = ""
+        status_text = ""
+        if is_past:
+            status_style = "background: #d4edda; border-left: 4px solid #28a745;"
+            status_text = " Ã¢ÂÂ"
+        elif is_today:
+            status_style = "background: #fff3cd; border-left: 4px solid #ffc107;"
+            status_text = " ð TODAY"
+        else:
+            status_style = "background: #f8f9fa; border-left: 4px solid #6c757d;"
+        
+        html += f"""
+            <div style="{status_style} padding: 15px; border-radius: 8px;">
+                <h6 style="margin: 0 0 8px 0; color: #333;">{day} {date_obj.strftime('(%b %d)')}{status_text}</h6>
+                <p style="margin: 0; font-size: 14px;">{workout}</p>
+            </div>
+        """
+    
+    html += '</div>'
+    
+    return html
+
+def generate_weekly_workouts(run_plan: str, week_num: int, plan_type: str = None) -> dict:
+    """Generate specific workouts for each day of the week."""
+    
+    base_workouts = {
+        'daily_fitness': {
+            'Monday': 'Rest Day - Light stretching or gentle yoga (20-30 minutes)',
+            'Tuesday': f'{3 + (week_num // 4)}-mile easy run at conversational pace',
+            'Wednesday': f'Tempo run: 1-mile warm-up + {2 + (week_num // 3)}-mile tempo + 1-mile cool-down',
+            'Thursday': f'{2 + (week_num // 6)}-mile recovery run at very easy pace',
+            'Friday': 'Rest Day - Complete rest or light cross-training',
+            'Saturday': f'{5 + week_num}-mile long run at steady, comfortable effort',
+            'Sunday': 'Cross-training: 30-45 minutes cycling, swimming, or yoga'
+        },
+        'fitness_goal': {
+            'Monday': f'Strength training + {2 + (week_num // 5)}-mile easy run',
+            'Tuesday': f'{4 + (week_num // 3)}-mile tempo run with negative split',
+            'Wednesday': 'Active recovery: 30 minutes easy cross-training',
+            'Thursday': f'Interval training: {3 + (week_num // 4)} x 800m at 5K pace',
+            'Friday': 'Rest Day',
+            'Saturday': f'{7 + week_num}-mile long run with progression',
+            'Sunday': 'Easy recovery run or cross-training (30-40 minutes)'
+        },
+        'athletic_goal': {
+            'Monday': f'{4 + (week_num // 3)}-mile easy run with strides',
+            'Tuesday': f'Track workout: {4 + (week_num // 2)} x 1000m at threshold pace',
+            'Wednesday': f'{3 + (week_num // 4)}-mile recovery run',
+            'Thursday': f'{6 + (week_num // 2)}-mile tempo run at half marathon pace',
+            'Friday': 'Rest Day with light stretching',
+            'Saturday': f'{10 + week_num}-mile long run with final {week_num} miles at marathon pace',
+            'Sunday': f'{4 + (week_num // 4)}-mile easy run'
+        }
+    }
+    
+    workouts = base_workouts.get(run_plan, base_workouts['daily_fitness']).copy()
+    
+    # Modify for group plans
+    if plan_type == 'group':
+        for day, workout in workouts.items():
+            if 'run' in workout.lower() and 'rest' not in workout.lower():
+                workouts[day] += ' (Group/Family Session - adjust pace for group dynamics)'
+    
+    return workouts
+
+def generate_weekly_schedule_template(run_plan: str, plan_type: str) -> str:
+    """Generate weekly schedule template."""
+    
+    templates = {
+        'daily_fitness': [
+            ('Monday', 'Rest/Active Recovery', 'Light movement, stretching, or complete rest'),
+            ('Tuesday', 'Base Building Run', 'Easy pace run building aerobic fitness'),
+            ('Wednesday', 'Tempo Run', 'Sustained moderate-hard effort training'),
+            ('Thursday', 'Recovery Run', 'Very easy pace for active recovery'),
+            ('Friday', 'Rest Day', 'Complete rest to prepare for weekend'),
+            ('Saturday', 'Long Run', 'Weekly long run for endurance building'),
+            ('Sunday', 'Cross-Training', 'Non-impact aerobic activity')
+        ],
+        'fitness_goal': [
+            ('Monday', 'Strength + Easy Run', 'Resistance training plus short easy run'),
+            ('Tuesday', 'Tempo Run', 'Sustained threshold pace training'),
+            ('Wednesday', 'Active Recovery', 'Light cross-training or rest'),
+            ('Thursday', 'Interval Training', 'High-intensity interval work'),
+            ('Friday', 'Rest Day', 'Complete rest for recovery'),
+            ('Saturday', 'Long Run', 'Progressive long run building endurance'),
+            ('Sunday', 'Easy Run/Cross', 'Recovery run or alternative activity')
+        ],
+        'athletic_goal': [
+            ('Monday', 'Easy Run + Strides', 'Aerobic run with short accelerations'),
+            ('Tuesday', 'Speed Work', 'Track intervals or tempo runs'),
+            ('Wednesday', 'Recovery Run', 'Easy pace active recovery'),
+            ('Thursday', 'Threshold Run', 'Sustained hard effort training'),
+            ('Friday', 'Rest Day', 'Complete rest before long run'),
+            ('Saturday', 'Long Run', 'Weekly long run with pace variations'),
+            ('Sunday', 'Easy Run', 'Recovery run to complete weekly volume')
+        ]
+    }
+    
+    schedule = templates.get(run_plan, templates['daily_fitness'])
+    
+    html = '<div style="display: grid; gap: 8px; margin: 15px 0;">'
+    
+    for day, workout_type, description in schedule:
+        html += f"""
+            <div style="display: grid; grid-template-columns: 100px 1fr 1fr; gap: 15px; padding: 10px; background: #f8f9fa; border-radius: 6px; align-items: center;">
+                <strong>{day}:</strong>
+                <span style="color: #007bff; font-weight: 600;">{workout_type}</span>
+                <span style="font-size: 13px; color: #666;">{description}</span>
+            </div>
+        """
+    
+    html += '</div>'
+    
+    group_note = ""
+    if plan_type == 'group':
+        group_note = """
+            <div style="background: #e7f3ff; padding: 15px; border-radius: 8px; margin-top: 15px; border-left: 4px solid #2196f3;">
+                <h6 style="color: #1976d2; margin: 0 0 8px 0;">Group Training Notes</h6>
+                <ul style="margin: 0; padding-left: 20px; font-size: 14px;">
+                    <li>Adjust paces to accommodate all group members</li>
+                    <li>Plan meeting points and routes that work for everyone</li>
+                    <li>Consider alternating leadership roles during runs</li>
+                    <li>Include social elements like post-run refreshments</li>
+                    <li>Maintain flexibility for individual recovery needs</li>
+                </ul>
+            </div>
+        """
+    
+    return html + group_note
+
+def generate_full_nutrition_plan(form_data: dict) -> str:
+    """Generate comprehensive nutrition plan for desktop view."""
+    
+    additional_details = form_data.get('additional_details', [''])[0].lower()
+    
+    html = """
+        <h4>Complete Nutrition Plan</h4>
+        
+        <h5>Daily Nutrition Guidelines</h5>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 15px 0;">
+            <div style="background: #e8f5e9; padding: 15px; border-radius: 8px;">
+                <h6 style="color: #2e7d32; margin-top: 0;">Macronutrient Targets</h6>
+                <ul style="margin: 0; padding-left: 20px;">
+                    <li><strong>Carbohydrates:</strong> 55-65% of total calories</li>
+                    <li><strong>Proteins:</strong> 15-20% of total calories</li>
+                    <li><strong>Fats:</strong> 20-30% of total calories</li>
+                    <li><strong>Hydration:</strong> Half body weight in ounces daily</li>
+                </ul>
+            </div>
+            <div style="background: #fff3e0; padding: 15px; border-radius: 8px;">
+                <h6 style="color: #f57c00; margin-top: 0;">Key Nutrients for Runners</h6>
+                <ul style="margin: 0; padding-left: 20px;">
+                    <li><strong>Iron:</strong> Lean meats, spinach, lentils</li>
+                    <li><strong>Calcium:</strong> Dairy, leafy greens, fortified foods</li>
+                    <li><strong>Antioxidants:</strong> Berries, colorful vegetables</li>
+                    <li><strong>Omega-3s:</strong> Fish, walnuts, chia seeds</li>
+                </ul>
+            </div>
+        </div>
+        
+        <h5>Workout Nutrition Timing</h5>
+        <div style="overflow-x: auto;">
+            <table style="width: 100%; border-collapse: collapse; margin: 15px 0;">
+                <thead>
+                    <tr style="background: #e9ecef;">
+                        <th style="padding: 12px; border: 1px solid #ddd; text-align: left;">Timing</th>
+                        <th style="padding: 12px; border: 1px solid #ddd; text-align: left;">Purpose</th>
+                        <th style="padding: 12px; border: 1px solid #ddd; text-align: left;">Recommended Foods</th>
+                        <th style="padding: 12px; border: 1px solid #ddd; text-align: left;">Amount</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td style="padding: 12px; border: 1px solid #ddd;"><strong>3-4 hours before</strong></td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Complete meal</td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Balanced meal with carbs, protein, minimal fat/fiber</td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">300-600 calories</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 12px; border: 1px solid #ddd;"><strong>30-60 minutes before</strong></td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Quick energy</td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Banana, toast with honey, energy bar</td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">100-200 calories</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 12px; border: 1px solid #ddd;"><strong>During (60+ min runs)</strong></td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Maintain energy</td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Sports drink, gels, dates</td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">30-60g carbs/hour</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 12px; border: 1px solid #ddd;"><strong>0-30 minutes after</strong></td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Recovery window</td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Chocolate milk, protein smoothie, recovery drink</td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">3:1 carb to protein ratio</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 12px; border: 1px solid #ddd;"><strong>2-4 hours after</strong></td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Complete recovery</td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Balanced meal with quality protein and carbs</td>
+                        <td style="padding: 12px; border: 1px solid #ddd;">Complete meal</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    """
+    
+    # Add dietary restriction modifications
+    if any(restriction in additional_details for restriction in ['dairy', 'lactose', 'gluten', 'vegan', 'vegetarian']):
+        html += """
+            <h5>Dietary Modifications</h5>
+            <div style="background: #fff8e1; padding: 15px; border-radius: 8px; margin: 15px 0; border-left: 4px solid #ffa000;">
+        """
+        
+        if 'dairy' in additional_details or 'lactose' in additional_details:
+            html += """
+                <p><strong>Dairy-Free Alternatives:</strong></p>
+                <ul>
+                    <li>Almond, oat, or soy milk instead of cow's milk</li>
+                    <li>Coconut yogurt or dairy-free Greek yogurt alternatives</li>
+                    <li>Plant-based protein powders (pea, hemp, rice)</li>
+                    <li>Calcium-fortified non-dairy beverages</li>
+                </ul>
+            """
+        
+        if 'gluten' in additional_details:
+            html += """
+                <p><strong>Gluten-Free Options:</strong></p>
+                <ul>
+                    <li>Rice cakes, quinoa, or sweet potatoes for pre-run carbs</li>
+                    <li>Certified gluten-free oats and energy bars</li>
+                    <li>Rice-based or corn-based sports drinks</li>
+                    <li>Natural whole foods focus (fruits, vegetables, lean proteins)</li>
+                </ul>
+            """
+        
+        if 'vegan' in additional_details or 'vegetarian' in additional_details:
+            html += """
+                <p><strong>Plant-Based Protein Sources:</strong></p>
+                <ul>
+                    <li>Legumes, quinoa, hemp seeds for complete proteins</li>
+                    <li>Plant-based protein powders (pea, hemp, rice protein)</li>
+                    <li>Nut butters and seeds for healthy fats and protein</li>
+                    <li>Fortified plant milks for B12 and other nutrients</li>
+                </ul>
+            """
+        
+        html += "</div>"
+    
+    html += """
+        <h5>Weekly Meal Planning</h5>
+        <div style="background: #f3e5f5; padding: 15px; border-radius: 8px; margin: 15px 0;">
+            <h6 style="color: #7b1fa2; margin-top: 0;">Sample Training Day Menu</h6>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                <div>
+                    <p><strong>Breakfast (2-3 hours before run):</strong><br>
+                    Oatmeal with berries, banana, and almond butter<br>
+                    <em>Provides sustained energy and easy digestion</em></p>
+                    
+                    <p><strong>Pre-Run Snack (30-60 min before):</strong><br>
+                    Banana with a small amount of honey<br>
+                    <em>Quick-digesting carbs for immediate energy</em></p>
+                    
+                    <p><strong>During Run (60+ minutes):</strong><br>
+                    Sports drink or 1-2 dates every 30-45 minutes<br>
+                    <em>Maintains blood sugar and electrolytes</em></p>
+                </div>
+                <div>
+                    <p><strong>Post-Run Recovery (within 30 min):</strong><br>
+                    Chocolate milk or protein smoothie with fruit<br>
+                    <em>3:1 carb to protein ratio for optimal recovery</em></p>
+                    
+                    <p><strong>Lunch (2-3 hours post-run):</strong><br>
+                    Quinoa bowl with vegetables and lean protein<br>
+                    <em>Complete recovery meal with anti-inflammatory foods</em></p>
+                    
+                    <p><strong>Dinner:</strong><br>
+                    Salmon, sweet potato, and steamed vegetables<br>
+                    <em>Omega-3s for recovery and complex carbs for glycogen</em></p>
+                </div>
+            </div>
+        </div>
+        
+        <h5>Hydration Strategy</h5>
+        <div style="background: #e1f5fe; padding: 15px; border-radius: 8px; margin: 15px 0;">
+            <ul style="margin: 0; padding-left: 20px;">
+                <li><strong>Daily baseline:</strong> Half your body weight in ounces of water</li>
+                <li><strong>Pre-exercise:</strong> 16-20 oz of fluid 2-3 hours before</li>
+                <li><strong>During exercise:</strong> 6-8 oz every 15-20 minutes</li>
+                <li><strong>Post-exercise:</strong> 150% of fluid losses (weigh before/after)</li>
+                <li><strong>Electrolyte replacement:</strong> Sports drinks for runs over 60 minutes</li>
+                <li><strong>Monitor status:</strong> Urine should be pale yellow</li>
+            </ul>
+        </div>
+    """
+    
+    return html
+
+def generate_todays_detailed_workout(plan_type: str, week: str, form_data: dict) -> str:
+    """Generate detailed workout that exactly matches weekly plan."""
+    from datetime import datetime
+    
+    today = datetime.now()
+    day_name = today.strftime('%A')
+    week_num = int(week.replace('week_', '')) if 'week_' in week else 1
+    
+    # Get base workout from weekly plan
+    weekly_plan = generate_matching_weekly_plan(plan_type, form_data.get('plan_type', [''])[0])
+    today_plan = next((day for day in weekly_plan if day['day'] == day_name[:3]), None)
+    
+    if not today_plan:
+        return "Rest day or easy recovery activity"
+    
+    base_workout = today_plan['workout']
+    
+    # Add detailed instructions based on workout type
+    workout_details = {
+        'rest day': 'Complete rest or 20-30 minutes of gentle stretching and mobility work',
+        'easy run': f'{3 + (week_num // 4)}-mile easy run at conversational pace. Focus on relaxed form and nasal breathing',
+        'tempo': f'{4 + (week_num // 3)}-mile tempo run: 10min warm-up, {15 + (week_num * 2)}min at comfortably hard effort, 10min cool-down',
+        'intervals': f'Interval session: 10min warm-up, {3 + (week_num // 4)}x800m at 5K pace with 90sec recovery jog, 10min cool-down',
+        'long run': f'{6 + week_num}-mile long run at easy-moderate effort. Start easy and gradually settle into rhythm',
+        'recovery': f'{2 + (week_num // 5)}-mile very easy recovery run. Focus on form and relaxation',
+        'cross training': 'Choose from cycling, swimming, elliptical, or yoga. Maintain aerobic effort for 30-45 minutes'
+    }
+    
+    # Find matching workout type and add details
+    base_lower = base_workout.lower()
+    for workout_type, details in workout_details.items():
+        if workout_type in base_lower:
+            return f"{base_workout} - {details}"
+    
+    return f"{base_workout} - Follow your planned training intensity and duration"
+
+def generate_all_weeks_plan(run_plan: str, plan_type: str, total_weeks: int, current_week: int) -> list:
+    """Generate training plans for all weeks with proper periodization."""
+    all_weeks = []
+    
+    for week_num in range(1, total_weeks + 1):
+        # Determine training phase based on week number
+        phase_percentage = (week_num / total_weeks) * 100
+        
+        if phase_percentage <= 40:
+            phase = "Base Building"
+            intensity_modifier = 0.7
+        elif phase_percentage <= 70:
+            phase = "Build Phase"
+            intensity_modifier = 1.0
+        elif phase_percentage <= 85:
+            phase = "Peak Phase"
+            intensity_modifier = 1.2
+        else:
+            phase = "Taper/Recovery"
+            intensity_modifier = 0.6
+        
+        # Generate base weekly plan
+        base_plan = generate_matching_weekly_plan(run_plan, plan_type)
+        
+        # Adjust for the specific week and phase
+        adjusted_plan = []
+        for day_plan in base_plan:
+            workout = day_plan['workout']
+            
+            # Adjust workout intensity based on phase
+            if "easy run" in workout.lower():
+                if phase == "Base Building":
+                    workout = workout.replace("easy run", "base building run")
+                elif phase == "Peak Phase":
+                    workout = workout.replace("easy run", "race pace segments")
+                elif phase == "Taper/Recovery":
+                    workout = workout.replace("easy run", "gentle recovery run")
+            elif "tempo" in workout.lower() or "intervals" in workout.lower():
+                if phase == "Base Building":
+                    workout = "Easy aerobic run"  # Replace hard workouts in base phase
+                elif phase == "Taper/Recovery":
+                    workout = workout.replace("tempo", "light fartlek").replace("intervals", "strides")
+            
+            adjusted_plan.append({
+                'day': day_plan['day'],
+                'workout': workout,
+                'completed': week_num < current_week or (week_num == current_week and day_plan.get('completed', False))
+            })
+        
+        week_data = {
+            'week_number': week_num,
+            'phase': phase,
+            'is_current': week_num == current_week,
+            'weekly_plan': adjusted_plan
+        }
+        
+        all_weeks.append(week_data)
+    
+    return all_weeks
+
+def generate_matching_weekly_plan(plan_type: str, plan_type_detail: str = None) -> list:
+    """Generate weekly plan that matches today's workout exactly."""
+    from datetime import datetime
+    
+    today = datetime.now()
+    current_day_index = today.weekday()  # 0 = Monday
+    
+    # Base plan structure
+    base_plans = {
+        'daily_fitness': [
+            {'day': 'Mon', 'workout': 'Rest day or light cross-training', 'completed': current_day_index > 0},
+            {'day': 'Tue', 'workout': '4-mile easy run', 'completed': current_day_index > 1},
+            {'day': 'Wed', 'workout': '6-mile tempo run', 'completed': current_day_index > 2},
+            {'day': 'Thu', 'workout': '3-mile recovery run', 'completed': current_day_index > 3},
+            {'day': 'Fri', 'workout': 'Rest day', 'completed': current_day_index > 4},
+            {'day': 'Sat', 'workout': '8-mile long run', 'completed': current_day_index > 5},
+            {'day': 'Sun', 'workout': 'Cross training or easy run', 'completed': current_day_index > 6}
+        ],
+        'fitness_goal': [
+            {'day': 'Mon', 'workout': 'Strength training + 3-mile easy run', 'completed': current_day_index > 0},
+            {'day': 'Tue', 'workout': '5-mile tempo run', 'completed': current_day_index > 1},
+            {'day': 'Wed', 'workout': 'Rest or active recovery', 'completed': current_day_index > 2},
+            {'day': 'Thu', 'workout': '4-mile intervals', 'completed': current_day_index > 3},
+            {'day': 'Fri', 'workout': 'Rest day', 'completed': current_day_index > 4},
+            {'day': 'Sat', 'workout': '10-mile long run', 'completed': current_day_index > 5},
+            {'day': 'Sun', 'workout': 'Cross training', 'completed': current_day_index > 6}
+        ],
+        'athletic_goal': [
+            {'day': 'Mon', 'workout': '5-mile easy run', 'completed': current_day_index > 0},
+            {'day': 'Tue', 'workout': '7-mile tempo with intervals', 'completed': current_day_index > 1},
+            {'day': 'Wed', 'workout': '4-mile recovery run', 'completed': current_day_index > 2},
+            {'day': 'Thu', 'workout': '6-mile threshold run', 'completed': current_day_index > 3},
+            {'day': 'Fri', 'workout': 'Rest day', 'completed': current_day_index > 4},
+            {'day': 'Sat', 'workout': '12-mile long run', 'completed': current_day_index > 5},
+            {'day': 'Sun', 'workout': '4-mile easy run', 'completed': current_day_index > 6}
+        ]
+    }
+    
+    plan = base_plans.get(plan_type, base_plans['daily_fitness']).copy()
+    
+    # Add group plan modifications
+    if plan_type_detail == 'group':
+        for day in plan:
+            if 'run' in day['workout'] and 'rest' not in day['workout'].lower():
+                day['workout'] += ' (group session)'
+    
+    return plan
+
+def generate_enhanced_nutrition_plan(form_data: dict) -> dict:
+    """Generate detailed nutrition plan based on form data."""
+    additional_details = form_data.get('additional_details', [''])[0].lower()
+    
+    nutrition_base = {
+        'pre_run': 'Banana with almond butter 30-60 minutes before running',
+        'during': 'Water every 15-20 minutes. Sports drink for runs over 60 minutes',
+        'post_run': 'Protein shake with carbs within 30 minutes of finishing'
+    }
+    
+    # Customize based on dietary restrictions
+    if any(restriction in additional_details for restriction in ['dairy', 'lactose']):
+        nutrition_base['post_run'] = 'Plant-based protein smoothie with fruit within 30 minutes'
+    
+    if 'gluten' in additional_details:
+        nutrition_base['pre_run'] = 'Gluten-free oatmeal or rice cakes with honey 30-60 minutes before'
+    
+    if any(diet in additional_details for diet in ['vegan', 'vegetarian']):
+        nutrition_base['post_run'] = 'Plant protein smoothie with banana and dates within 30 minutes'
+        nutrition_base['pre_run'] = 'Oatmeal with fruit or energy balls 30-60 minutes before'
+    
+    return nutrition_base
+
+def generate_detailed_strength_plan() -> dict:
+    """Generate comprehensive strength training plan."""
+    return {
+        'schedule': 'Tuesday & Friday evenings (45 minutes each)',
+        'focus': 'Running-specific strength, core stability, and injury prevention',
+        'exercises': 'Squats, lunges, single-leg deadlifts, planks, glute bridges, calf raises, hip flexor stretches',
+        'duration': '45 minutes per session (3 sets of 12-15 reps)',
+        'progression': 'Increase resistance or reps weekly'
+    }
+
+def generate_detailed_mindfulness_plan() -> dict:
+    """Generate comprehensive mindfulness plan."""
+    return {
+        'practice': '10-minute morning meditation using breathing awareness',
+        'focus': 'Present moment awareness, breath control, and body scanning',
+        'running': 'Mid-run focus on cadence counting and rhythmic breathing patterns',
+        'recovery': '5-minute evening gratitude practice and progressive muscle relaxation'
+    }
+
+def extract_dietary_restrictions(additional_details: str) -> str:
+    """Extract dietary restrictions from additional details."""
+    restrictions = []
+    details_lower = additional_details.lower()
+    
+    restriction_keywords = {
+        'dairy': 'Avoiding dairy products',
+        'lactose': 'Lactose intolerant',
+        'gluten': 'Gluten-free diet',
+        'vegan': 'Following vegan diet',
+        'vegetarian': 'Following vegetarian diet',
+        'nut': 'Nut allergies',
+        'soy': 'Soy restrictions'
+    }
+    
+    for keyword, description in restriction_keywords.items():
+        if keyword in details_lower:
+            restrictions.append(description)
+    
+    return '; '.join(restrictions) if restrictions else None
+
+def format_hour_for_enhanced_cards(hour_data: dict) -> dict:
+    """Enhanced format hour data for mobile cards with weather icons."""
+    full_rec = hour_data.get('running_recommendation', '')
+    short_rec = extract_main_reason(full_rec)
+    
+    return {
+        'time': hour_data.get('Hour', 'N/A'),
+        'score': round(hour_data.get('raw_score', 0), 1),
+        'score_text': get_score_text(hour_data.get('raw_score', 0)),
+        'temp': hour_data.get('Temp', 'N/A'),
+        'wind': hour_data.get('Wind', 'N/A'),
+        'humidity': hour_data.get('Humidity', 'N/A'),
+        'precip': hour_data.get('Precip', 'N/A'),
+        'forecast': hour_data.get('Forecast', ''),
+        'recommendation': short_rec,
+        'full_recommendation': full_rec,  # Add full recommendation
+        'heat_stress': hour_data.get('heat_stress_level', 'Unknown'),
+        'solar_phase': hour_data.get('solar_phase', 'daylight'),
+        'is_solar_time': hour_data.get('is_solar_time', True)
+    }
+
+def generate_enhanced_card_data(scored_data: List, city: str, form_data: dict, profile_data: dict = None) -> dict:
+    """Generate enhanced structured data for mobile card interface."""
+    if not scored_data:
+        return {"error": f"No weather data available for {city}."}
+
+    # Separate today and tomorrow data
+    today_hours = [h for h in scored_data if h.get('Day') == 'today']
+    tomorrow_hours = [h for h in scored_data if h.get('Day') == 'tomorrow']
+    
+    # Find best hour ranges - group consecutive hours with same score
+    def find_best_hour_ranges(hours_data, top_n=2):
+        """Find the best hour ranges and return top recommendations."""
+        if not hours_data:
+            return []
+        
+        # Sort by score descending, then by hour
+        sorted_hours = sorted(hours_data, key=lambda x: (-x.get('raw_score', 0), x.get('HourNum', 0)))
+        
+        # Group consecutive hours with similar scores (within 0.2 points)
+        hour_groups = []
+        current_group = [sorted_hours[0]]
+        
+        for hour in sorted_hours[1:]:
+            if (abs(hour.get('raw_score', 0) - current_group[0].get('raw_score', 0)) <= 0.2 and 
+                hour.get('HourNum', 0) == current_group[-1].get('HourNum', 0) + 1):
+                current_group.append(hour)
+            else:
+                hour_groups.append(current_group)
+                current_group = [hour]
+        hour_groups.append(current_group)
+        
+        # Sort groups by average score
+        hour_groups.sort(key=lambda g: -sum(h.get('raw_score', 0) for h in g) / len(g))
+        
+        recommendations = []
+        for i, group in enumerate(hour_groups[:top_n]):
+            avg_score = sum(h.get('raw_score', 0) for h in group) / len(group)
+            if len(group) > 1:
+                time_range = f"{group[0].get('Hour', 'N/A')} - {group[-1].get('Hour', 'N/A')}"
+            else:
+                time_range = group[0].get('Hour', 'N/A')
+            
+            rec = {
+                'time': time_range,
+                'day': 'Today' if group[0].get('Day') == 'today' else 'Tomorrow',
+                'score': round(avg_score, 1),
+                'temp': group[0].get('Temp', 'N/A'),
+                'reason': generate_enhanced_reason(group[0], 'best' if i == 0 else 'good')
+            }
+            recommendations.append(rec)
+        
+        return recommendations
+    
+    # Get best recommendations from all scored data
+    all_recommendations = find_best_hour_ranges(scored_data, top_n=2)
+    
+    # Calculate summary statistics
+    all_scores = [h.get('raw_score', 0) for h in scored_data]
+    avg_score = sum(all_scores) / len(all_scores) if all_scores else 0
+    best_hours = len([s for s in all_scores if s >= 4.0])
+    
+    # Get air quality
+    aqi_category = scored_data[0].get('aqi_category', 'Unknown') if scored_data else 'Unknown'
+    
+    # Calculate averages
+    all_temps = [h.get('Temp') for h in scored_data if h.get('Temp') != 'N/A']
+    avg_temp = sum(all_temps) / len(all_temps) if all_temps else 70
+
+    # Generate profile data (base version)
+    profile_card_data = generate_enhanced_profile_card_data(form_data)
+    
+    # CRITICAL: Override with LLM-generated wellness content if provided
+    if profile_data:
+        if profile_data.get('nutrition'):
+            profile_card_data['nutrition'] = profile_data['nutrition']
+            logger.info("Applied LLM-generated nutrition content to profile card")
+        
+        if profile_data.get('strength_training'):
+            profile_card_data['strength_training'] = profile_data['strength_training']
+            logger.info("Applied LLM-generated strength training content to profile card")
+        
+        if profile_data.get('mindfulness'):
+            profile_card_data['mindfulness'] = profile_data['mindfulness']
+            logger.info("Applied LLM-generated mindfulness content to profile card")
+            
+        # Also pass dietary restrictions for display
+        if profile_data.get('dietary_restrictions'):
+            profile_card_data['dietary_restrictions'] = profile_data['dietary_restrictions']
+        
+        if profile_data.get('health_conditions'):
+            profile_card_data['health_conditions'] = profile_data['health_conditions']
+
+    # Calculate calories if profile data available
+    calorie_data = None
+    if profile_card_data and profile_card_data.get('has_profile'):
+        age = form_data.get('age', [''])[0]
+        weight = form_data.get('weight', [''])[0]
+        height_feet = form_data.get('height_feet', [''])[0]
+        height_inches = form_data.get('height_inches', [''])[0]
+        gender = form_data.get('gender', ['male'])[0]
+        
+        # Get workout details
+        today_workout = profile_card_data.get('today_workout', '')
+        
+        # Extract duration from workout (parse for time estimates)
+        duration_match = re.search(r'(\d+)\s*(?:min|minutes)', today_workout.lower())
+        if duration_match:
+            duration_minutes = int(duration_match.group(1))
+            logger.info(f"Duration extracted from 'minutes' pattern: {duration_minutes} min")
+        else:
+            # Estimate based on mileage - handle both "12 miles" and "12-mile" formats
+            miles_match = re.search(r'(\d+(?:\.\d+)?)\s*[-\s]?\s*(?:mile|mi)', today_workout.lower())
+            if miles_match:
+                miles = float(miles_match.group(1))
+                duration_minutes = int(miles * 10)  # Assume 10 min/mile average
+                logger.info(f"Duration estimated from mileage: {miles} miles × 10 min/mile = {duration_minutes} min")
+            else:
+                duration_minutes = 30  # Default
+                logger.info(f"Using default duration: {duration_minutes} min")
+        
+        # Determine intensity from workout description
+        workout_lower = today_workout.lower()
+        if any(word in workout_lower for word in ['easy', 'recovery', 'light']):
+            intensity = 'easy'
+        elif any(word in workout_lower for word in ['tempo', 'threshold']):
+            intensity = 'moderate'
+        elif any(word in workout_lower for word in ['interval', 'speed', 'hard']):
+            intensity = 'hard'
+        else:
+            intensity = 'moderate'
+        
+        # Get best dewpoint from scored data (from the best weather window)
+        best_hour = max(scored_data, key=lambda x: x.get('raw_score', 0))
+        best_dewpoint = best_hour.get('dewpoint_fahrenheit', 65)
+        if best_dewpoint == 'N/A':
+            best_dewpoint = 65
+        
+        if all([age, weight, height_feet, height_inches]):
+            try:
+                calorie_data = calculate_estimated_calories(
+                    int(age), int(weight), int(height_feet), int(height_inches),
+                    gender, today_workout, duration_minutes, intensity, float(best_dewpoint)
+                )
+            except Exception as e:
+                logger.error(f"Error calculating calories: {e}")
+
+    card_data = {
+        'location': city,
+        'date': datetime.now().strftime("%b %d, %Y"),
+        
+        'summary': {
+            'best_hours': best_hours,
+            'avg_score': round(avg_score, 1),
+            'avg_temp': round(avg_temp),
+            'air_quality': aqi_category,
+            'best_time': all_recommendations[0] if all_recommendations else None,
+            'second_best_time': all_recommendations[1] if len(all_recommendations) > 1 else None,
+            'estimated_calories': calorie_data
+        },
+        
+        'profile': profile_card_data,
+        
+        'today': [format_hour_for_enhanced_cards(hour) for hour in today_hours[:6]],
+        'tomorrow': [format_hour_for_enhanced_cards(hour) for hour in tomorrow_hours[:6]],
+        
+        'details': {
+            'heat_stress': calculate_heat_stress_summary(scored_data),
+            'wind_patterns': calculate_wind_summary(scored_data),
+            'precipitation': calculate_precip_summary(scored_data),
+            'air_quality': {
+                'aqi': extract_aqi_number(scored_data),
+                'category': aqi_category,
+                'restrictions': get_aqi_restrictions(aqi_category)
+            }
+        }
+    }
+    
+    return card_data
+
+def generate_enhanced_reason(hour_data: dict, type_context: str) -> str:
+    """Generate enhanced reasons for best/worst/good times."""
+    temp = hour_data.get('Temp', 'N/A')
+    humidity = hour_data.get('Humidity', 'N/A')
+    wind = hour_data.get('Wind', 'N/A')
+    precip = hour_data.get('Precip', 0)
+    solar_phase = hour_data.get('solar_phase', 'daylight')
+    
+    if type_context == 'best':
+        reasons = []
+        if temp != 'N/A' and 60 <= temp <= 75:
+            reasons.append(f"ideal temperature (<strong>{temp}°F</strong>)")
+        if humidity != 'N/A' and humidity < 60:
+            reasons.append(f"comfortable humidity ({humidity}%)")
+        if wind != 'N/A' and 3 <= wind <= 8:
+            reasons.append(f"light cooling breeze ({wind}mph)")
+        if precip == 0:
+            reasons.append("no precipitation expected")
+        if solar_phase == 'night':
+            reasons.append("cooler nighttime conditions")
+        
+        if reasons:
+            return f"Optimal conditions: {', '.join(reasons)}"
+        else:
+            return "Generally favorable running conditions"
+    
+    elif type_context == 'good':
+        reasons = []
+        if temp != 'N/A' and 55 <= temp <= 78:
+            reasons.append(f"good temperature (<strong>{temp}°F</strong>)")
+        if humidity != 'N/A' and humidity < 70:
+            reasons.append(f"manageable humidity ({humidity}%)")
+        if wind != 'N/A' and wind < 12:
+            reasons.append(f"acceptable wind ({wind}mph)")
+        if precip <= 20:
+            reasons.append(f"low precipitation chance ({precip}%)")
+        
+        if reasons:
+            return f"Good alternative: {', '.join(reasons)}"
+        else:
+            return "Acceptable running conditions"
+    
+    else:  # worst
+        challenges = []
+        if temp != 'N/A' and temp >= 85:
+            challenges.append(f"high heat stress (<strong>{temp}°F</strong>)")
+        elif temp != 'N/A' and temp <= 35:
+            challenges.append(f"very cold conditions (<strong>{temp}°F</strong>)")
+        if humidity != 'N/A' and humidity >= 80:
+            challenges.append(f"high humidity ({humidity}%)")
+        if wind != 'N/A' and wind >= 15:
+            challenges.append(f"strong winds ({wind}mph)")
+        if precip >= 50:
+            challenges.append(f"high chance of rain ({precip}%)")
+        
+        if challenges:
+            return f"Challenging conditions: {', '.join(challenges)}"
+        else:
+            return "Suboptimal running conditions requiring extra caution"
+
+def generate_enhanced_workout(plan_type: str, week: str, form_data: dict) -> str:
+    """Generate enhanced workout for today based on plan type and week."""
+    week_num = int(week.replace('week_', '')) if 'week_' in week else 1
+    
+    # Get day of week for context
+    today = datetime.now()
+    day_name = today.strftime('%A')
+    
+    workouts = {
+        'daily_fitness': {
+            'Monday': 'Rest day or light cross-training',
+            'Tuesday': f'{3 + (week_num // 4)}-mile easy run',
+            'Wednesday': f'{4 + (week_num // 3)}-mile tempo run with {2 + (week_num // 5)}x800m intervals',
+            'Thursday': f'{2 + (week_num // 6)}-mile recovery run',
+            'Friday': 'Rest day',
+            'Saturday': f'{6 + week_num}-mile long run',
+            'Sunday': 'Cross training (cycling, swimming, or yoga)'
+        },
+        'fitness_goal': {
+            'Monday': 'Strength training + 3-mile easy run',
+            'Tuesday': f'{4 + (week_num // 3)}-mile tempo run',
+            'Wednesday': 'Rest or active recovery',
+            'Thursday': f'{5 + (week_num // 4)}-mile steady run',
+            'Friday': 'Rest day',
+            'Saturday': f'{8 + week_num}-mile long run',
+            'Sunday': 'Cross training'
+        },
+        'athletic_goal': {
+            'Monday': f'{4 + (week_num // 3)}-mile easy run',
+            'Tuesday': f'{6 + (week_num // 2)}-mile tempo run with {3 + (week_num // 4)}x1mile intervals',
+            'Wednesday': f'{3 + (week_num // 5)}-mile recovery run',
+            'Thursday': f'{7 + (week_num // 3)}-mile threshold run',
+            'Friday': 'Rest day',
+            'Saturday': f'{12 + week_num}-mile long run',
+            'Sunday': f'{5 + (week_num // 4)}-mile easy run'
+        }
+    }
+    
+    return workouts.get(plan_type, {}).get(day_name, "Easy run")
+
+def generate_enhanced_weekly_plan(plan_type: str, plan_type_detail: str = None) -> list:
+    """Generate enhanced weekly plan with completed status."""
+    today = datetime.now()
+    current_day = today.weekday()  # 0 = Monday
+    
+    base_plan = [
+        {'day': 'Mon', 'workout': 'Rest day', 'completed': current_day > 0},
+        {'day': 'Tue', 'workout': '4-mile easy run', 'completed': current_day > 1},
+        {'day': 'Wed', 'workout': '6-mile tempo with intervals', 'completed': current_day > 2},
+        {'day': 'Thu', 'workout': '3-mile recovery run', 'completed': current_day > 3},
+        {'day': 'Fri', 'workout': 'Rest day', 'completed': current_day > 4},
+        {'day': 'Sat', 'workout': '10-mile long run', 'completed': current_day > 5},
+        {'day': 'Sun', 'workout': 'Cross training', 'completed': current_day > 6}
+    ]
+    
+    # Modify based on plan type
+    if plan_type == 'athletic_goal':
+        base_plan[1]['workout'] = '6-mile tempo run with speed work'
+        base_plan[5]['workout'] = '12-mile long run'
+    elif plan_type == 'daily_fitness' and plan_type_detail == 'group':
+        for day in base_plan:
+            day['workout'] += ' (group session)'
+    
+    return base_plan
+
+def generate_enhanced_nutrition(form_data: dict) -> dict:
+    """Generate enhanced nutrition guidance."""
+    additional_details = form_data.get('additional_details', [''])[0].lower()
+    
+    nutrition = {
+        'pre_run': 'Banana + coffee (30min before)',
+        'during': 'Water every 2 miles, sports drink for runs >60min',
+        'post_run': 'Protein shake + carbs within 30min'
+    }
+    
+    # Customize based on dietary restrictions mentioned
+    if 'dairy' in additional_details or 'lactose' in additional_details:
+        nutrition['post_run'] = 'Plant-based protein shake + carbs within 30min'
+    if 'gluten' in additional_details:
+        nutrition['pre_run'] = 'Gluten-free oatmeal or banana (30min before)'
+    if 'vegan' in additional_details or 'vegetarian' in additional_details:
+        nutrition['post_run'] = 'Plant protein + quinoa/sweet potato within 30min'
+    
+    return nutrition
+
+def generate_strength_training_plan() -> dict:
+    """Generate strength training plan."""
+    return {
+        'schedule': 'Tuesday & Friday evenings',
+        'focus': 'Core stability, leg strength, and injury prevention',
+        'exercises': 'Squats, lunges, single-leg deadlifts, planks, glute bridges, calf raises',
+        'duration': '30-45 minutes per session',
+        'progression': 'Increase reps/weight weekly'
+    }
+
+def generate_mindfulness_plan() -> dict:
+    """Generate mindfulness plan."""
+    return {
+        'practice': '10-minute morning meditation',
+        'focus': 'Breathing awareness and body scanning',
+        'running': 'Focus on cadence, breath rhythm, and present moment awareness',
+        'recovery': '5-minute evening gratitude practice',
+        'techniques': 'Box breathing, body scan, mindful walking'
+    }
+
+def extract_dietary_notes(additional_details: str) -> str:
+    """Extract dietary restrictions and notes from additional details."""
+    dietary_keywords = ['dairy', 'gluten', 'vegan', 'vegetarian', 'allergy', 'intolerant', 'avoid', 'diet']
+    lines = additional_details.lower().split('.')
+    
+    dietary_notes = []
+    for line in lines:
+        if any(keyword in line for keyword in dietary_keywords):
+            dietary_notes.append(line.strip().capitalize())
+    
+    return ' | '.join(dietary_notes) if dietary_notes else None
+
+def generate_sample_workout(plan_type: str, week: str) -> str:
+    """Generate sample workout for today."""
+    workouts = {
+        'daily_fitness': "30-minute easy pace run",
+        'fitness_goal': "4-mile tempo run", 
+        'athletic_goal': "6-mile tempo run with 3x1mile intervals"
+    }
+    return workouts.get(plan_type, "Easy run")
+
+def generate_sample_weekly_plan(plan_type: str) -> list:
+    """Generate sample weekly plan."""
+    return [
+        {'day': 'Mon', 'workout': 'Rest day', 'completed': True},
+        {'day': 'Tue', 'workout': '4-mile easy run', 'completed': True},
+        {'day': 'Wed', 'workout': '6-mile tempo', 'completed': False},
+        {'day': 'Thu', 'workout': '3-mile recovery', 'completed': False},
+        {'day': 'Fri', 'workout': 'Rest', 'completed': False},
+        {'day': 'Sat', 'workout': '10-mile long run', 'completed': False},
+        {'day': 'Sun', 'workout': 'Cross training', 'completed': False}
+    ]
+
+def generate_sample_nutrition() -> dict:
+    """Generate sample nutrition guidance."""
+    return {
+        'pre_run': 'Banana + coffee (30min before)',
+        'during': 'Water every 2 miles',
+        'post_run': 'Protein shake within 30min'
+    }
+
+#Summary Calculation Functions
+
+def calculate_heat_stress_summary(scored_data: List) -> dict:
+    """Calculate heat stress summary."""
+    all_temps = [h.get('Temp') for h in scored_data if h.get('Temp') != 'N/A']
+    all_dewpoints = [h.get('dewpoint_fahrenheit') for h in scored_data if h.get('dewpoint_fahrenheit') != 'N/A']
+    
+    return {
+        'peak_heat_index': f"<strong>{max(all_temps)}°F</strong>" if all_temps else "N/A",
+        'dewpoint_range': f"<strong>{min(all_dewpoints)}°F</strong> - <strong>{max(all_dewpoints)}°F</strong>" if all_dewpoints else "N/A",
+        'uv_index': "6 (High)"  # This would come from weather API in real implementation
+    }
+
+def calculate_wind_summary(scored_data: List) -> dict:
+    """Calculate wind summary."""
+    morning_winds = [h.get('Wind') for h in scored_data if h.get('HourNum', 24) < 12 and h.get('Wind') != 'N/A']
+    afternoon_winds = [h.get('Wind') for h in scored_data if h.get('HourNum', 0) >= 12 and h.get('Wind') != 'N/A']
+    
+    morning_avg = sum(morning_winds) / len(morning_winds) if morning_winds else 0
+    afternoon_avg = sum(afternoon_winds) / len(afternoon_winds) if afternoon_winds else 0
+    
+    return {
+        'morning': f"{morning_avg:.0f} mph (favorable)" if morning_avg < 10 else f"{morning_avg:.0f} mph (strong)",
+        'afternoon': f"{afternoon_avg:.0f} mph (variable)",
+        'direction': "SW (tailwind on usual route)"  # This would come from weather API
+    }
+
+def calculate_precip_summary(scored_data: List) -> dict:
+    """Calculate precipitation summary."""
+    today_precip = max([h.get('Precip', 0) for h in scored_data if h.get('Day') == 'today'], default=0)
+    tomorrow_precip = max([h.get('Precip', 0) for h in scored_data if h.get('Day') == 'tomorrow'], default=0)
+    
+    return {
+        'today': f"{today_precip}% chance" + (" (2-4 PM)" if today_precip > 0 else ""),
+        'tomorrow': f"{tomorrow_precip}% chance all day", 
+        'type': "Scattered light showers" if max(today_precip, tomorrow_precip) > 0 else "No precipitation expected"
+    }
+
+def extract_aqi_number(scored_data: List) -> int:
+    """Extract AQI number from scored data or fetch fresh AQI data."""
+    # First try to get AQI from the scored data if it exists
+    for hour in scored_data:
+        if 'aqi_value' in hour and hour['aqi_value'] != 'N/A':
+            return int(hour['aqi_value'])
+    
+    # If not found in scored data, try to extract from the original AQI response
+    # This matches the pattern already used in your handle_forecast_request function
+    try:
+        city = scored_data[0].get('city') if scored_data else None
+        if city:
+            aqi_data = get_air_quality_from_server.invoke({"city": city})
+            aqi_match = re.search(r'\b(\d{1,3})\b', aqi_data)
+            if aqi_match:
+                return int(aqi_match.group(1))
+    except Exception as e:
+        logger.warning(f"Could not extract AQI number: {e}")
+    
+    # Return None or a default if no AQI data is available
+    return None
+
+def get_aqi_restrictions(category: str) -> str:
+    """Get AQI restrictions based on category."""
+    restrictions = {
+        'Good': 'No restrictions',
+        'Moderate': 'Sensitive individuals may experience minor issues',
+        'Unhealthy for Sensitive': 'Sensitive groups should limit outdoor activity',
+        'Unhealthy': 'Everyone should limit outdoor activity',
+        'Very Unhealthy': 'Avoid outdoor activity',
+        'Hazardous': 'Emergency conditions - avoid all outdoor activity'
+    }
+    return restrictions.get(category, 'No information available')
+
+#Mobile HTML Generation Function
+
+def generate_mobile_card_html(card_data: dict) -> str:
+    """Generate HTML for mobile card interface with enhanced features."""
+    location = card_data.get('location', 'Unknown')
+    date_str = card_data.get('date', '')
+    
+    # Count visible cards
+    visible_cards = ['summary']
+    if card_data.get('profile', {}).get('has_profile'):
+        visible_cards.append('profile')
+    if needs_nutrition_card_check(card_data):
+        visible_cards.append('nutrition')
+    if card_data.get('today'):
+        visible_cards.append('today')
+    if card_data.get('tomorrow'):
+        visible_cards.append('tomorrow')
+    visible_cards.append('details')
+    
+    card_count = len(visible_cards)
+    
+    # Generate the mobile HTML template with dynamic data
+    html_template = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Running Forecast Cards</title>
+        <link rel="stylesheet" href="/static/mobile-cards.css">
+    </head>
+    <body>
+        <div class="app-container">
+            <div class="header">
+                <h1>🌅🏃‍♂️ Running Forecast</h1>
+                <div class="location-info">
+                    <span>📍 {location}</span>
+                    <span>📅 {date_str}</span>
+                </div>
+            </div>
+            
+            <div class="card-controls">
+                <div class="section-selector">
+                    <!-- Buttons will be dynamically generated by JavaScript -->
+                </div>
+                <div class="sequence-controls">
+                    <div class="sequence-info">Card <span id="current-card">1</span> of <span id="total-cards">{card_count}</span></div>
+                    <div class="control-buttons">
+                        <button class="hide-btn" onclick="toggleCardVisibility()">🙈 Hide</button>
+                        <button class="reorder-btn" onclick="openReorderModal()">🔄 Reorder</button>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card-container" id="card-container">
+                <!-- Cards will be dynamically inserted here -->
+            </div>
+            
+            <div class="navigation">
+                <button class="nav-btn" id="prev-btn" onclick="previousCard()">◀️</button>
+                <button class="nav-btn" id="next-btn" onclick="nextCard()">▶️</button>
+            </div>
+        </div>
+        
+        <!-- Reorder Modal -->
+        <div class="reorder-modal" id="reorder-modal">
+            <div class="reorder-content">
+                <h3>🗂️ Manage Cards</h3>
+                <p style="font-size: 12px; color: #666; margin-bottom: 15px;">Drag to reorder, click to hide/show:</p>
+                <div id="reorder-list">
+                    <!-- Reorder items will be dynamically generated -->
+                </div>
+                <div style="display: flex; gap: 10px; margin-top: 20px;">
+                    <button onclick="applyReorder()" style="flex: 1; padding: 10px; background: #4CAF50; color: white; border: none; border-radius: 8px;">Apply Changes</button>
+                    <button onclick="closeReorderModal()" style="flex: 1; padding: 10px; background: #999; color: white; border: none; border-radius: 8px;">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="touch-indicator">Swipe or use arrows to navigate • Tap controls to customize</div>
+        
+        <script>
+            // Inject card data into JavaScript
+            window.cardData = {json.dumps(card_data)};
+        </script>
+        <script src="/static/mobile-cards.js"></script>
+    </body>
+    </html>
+    """
+
+    
+    return html_template
+
+def needs_nutrition_card_check(card_data: dict) -> bool:
+    """Check if nutrition card is needed based on card data."""
+    profile = card_data.get('profile', {})
+    return (profile.get('has_profile') and 
+            (profile.get('nutrition') or 
+             profile.get('strength_training') or 
+             profile.get('mindfulness')))
+
+# --- Main Workflow Function ---
+
+def run_agent_workflow(form_data: dict) -> dict:
+    """
+    Main workflow that processes form data and generates running forecasts.
+    Now aligned with web_ui.py expectations and handles new UI fields.
+    """
+    try:
+        # Extract form data
+        location = form_data.get('location', [''])[0]
+        action = form_data.get('action', ['get_forecast'])[0]
+        email = form_data.get('email', [''])[0]
+        
+        if not location:
+            return {
+                'final_html': '<div style="color: red;">Error: Location is required.</div>',
+                'final_user_message': 'Please provide a location.'
+            }
+
+        # Convert location if it's a zip code
+        city = get_city_from_zipcode.invoke({"zip_code": location})
+
+        # Extract time windows
+        time_windows = {}
+        window_names = ['today_1', 'today_2', 'tomorrow_1', 'tomorrow_2']
+        
+        for window_name in window_names:
+            start_key = f'{window_name}_start'
+            end_key = f'{window_name}_end'
+            start_time = form_data.get(start_key, [''])[0]
+            end_time = form_data.get(end_key, [''])[0]
+            
+            if start_time and end_time:
+                time_windows[window_name] = (start_time, end_time)
+
+        if not time_windows:
+            return {
+                'final_html': '<div style="color: red;">Error: At least one time window is required.</div>',
+                'final_user_message': 'Please select at least one time window.'
+            }
+
+        # Handle different actions
+        if action == 'get_forecast':
+            return handle_enhanced_forecast_request(city, time_windows, form_data)
+        elif action == 'email_now':
+            return handle_email_now_request(city, time_windows, form_data, email)
+        elif action == 'schedule':
+            return handle_schedule_request(city, time_windows, form_data, email)
+        else:
+            return {
+                'final_html': f'<div style="color: red;">Error: Unknown action "{action}".</div>',
+                'final_user_message': 'Invalid action requested.'
+            }
+
+    except Exception as e:
+        logger.error(f"Workflow error: {e}")
+        return {
+            'final_html': f'<div style="color: red;">Error: {str(e)}</div>',
+            'final_user_message': f'An error occurred: {str(e)}'
+        }
+
+def handle_enhanced_forecast_request(city: str, time_windows: dict, form_data: dict) -> dict:
+    """
+    FIXED: Enhanced forecast request handler that ensures consistent output 
+    for both mobile and desktop views across all action types.
+    """
+    try:
+        # Existing weather fetching code...
+        weather_response = get_weather_forecast_from_server.invoke({"city": city, "granularity": "hourly"})
+        aqi_data = get_air_quality_from_server.invoke({"city": city})
+        
+        # Parse weather data
+        weather_data = parse_weather_data(weather_response)
+        today_data = weather_data.get('today', [])
+        tomorrow_data = weather_data.get('tomorrow', [])
+
+        # Process time windows and score hours
+        all_scored_hours = []
+        seen_hours = set()
+
+        def time_to_hour(time_str): 
+            return int(time_str.split(':')[0])
+
+        for window_key, times in time_windows.items():
+            start_hour, end_hour = time_to_hour(times[0]), time_to_hour(times[1])
+            data_source = today_data if 'today' in window_key else tomorrow_data
+            
+            filtered = [h for h in data_source if h['HourNum'] != "N/A" and start_hour <= h['HourNum'] <= end_hour]
+            
+            # Parse AQI
+            today_aqi_match = re.search(r'\b(\d{1,3})\b', aqi_data)
+            today_aqi = int(today_aqi_match.group(1)) if today_aqi_match else "N/A"
+
+            scored = [score_hour_with_scientific_approach(h, aqi_value=today_aqi) for h in filtered]
+            
+            for hour in scored:
+                hour_key = (hour.get('day_category'), hour.get('HourNum'))
+                if hour_key not in seen_hours:
+                    all_scored_hours.append(hour)
+                    seen_hours.add(hour_key)
+
+        if not all_scored_hours:
+            return {
+                'final_html': f"<div style='color: #F44336;'>No data available for the selected time windows in {city}.</div>",
+                'final_user_message': f'No forecast data available for {city}.'
+            }
+
+        all_scored_hours.sort(key=lambda x: (x.get('day_category', 'z'), x.get('HourNum', 0)))
+        
+        # Check if this is a mobile request
+        is_mobile_request = form_data.get('mobile_view', ['false'])[0] == 'true'
+        
+        if is_mobile_request:
+            # Generate enhanced card data for mobile
+            card_data = generate_enhanced_card_data(all_scored_hours, city, form_data)
+            mobile_html = generate_mobile_card_html(card_data)
+            
+            return {
+                'final_html': mobile_html,
+                'final_user_message': f'Enhanced mobile forecast generated for {city}.',
+                'is_mobile': True,
+                'card_data': card_data  # CRITICAL: Always include card_data for mobile
+            }
+        else:
+            # Generate traditional HTML with profile for desktop
+            profile_html = ""
+            if any(form_data.get(key, [''])[0] for key in ['vita_avatar', 'age', 'run_plan']):
+                try:
+                    runner_profile_prompt = format_runner_profile_prompt(form_data)
+                    profile_html = get_llm_run_plan_summary(runner_profile_prompt)
+                    profile_html = f"""
+                        <div style="margin: 20px 0; padding: 20px; background: #f8f9fa; border-radius: 8px; border-left: 4px solid #007bff;">
+                            <h3 style="color: #007bff; margin-top: 0;">Your Personalized Running Plan</h3>
+                            {profile_html}
+                        </div>
+                    """
+                except Exception as e:
+                    logger.error(f"Error generating runner profile: {e}")
+
+            forecast_html = generate_compact_html_analysis(all_scored_hours, city)
+            
+            return {
+                'final_html': profile_html + forecast_html,
+                'final_user_message': f'Forecast generated successfully for {city}.',
+                'is_mobile': False
+            }
+
+    except Exception as e:
+        logger.error(f"Error in enhanced forecast request: {e}")
+        return {
+            'final_html': f'<div style="color: red;">Error generating forecast: {str(e)}</div>',
+            'final_user_message': f'Error generating forecast: {str(e)}'
+        }
+
+# Replace this function completely
+def handle_forecast_request(city: str, time_windows: dict, form_data: dict) -> dict:
+    return handle_enhanced_desktop_forecast_request(city, time_windows, form_data)
+
+def handle_email_now_request(city: str, time_windows: dict, form_data: dict, email: str) -> dict:
+    """Handle immediate email request."""
+    if not email:
+        return {
+            'final_html': '<div style="color: red;">Error: Email address is required.</div>',
+            'final_user_message': 'Please provide an email address.'
+        }
+
+    try:
+        # Generate forecast
+        forecast_result = handle_enhanced_forecast_request(city, time_windows, form_data)
+        
+        if 'Error' in forecast_result['final_html']:
+            return forecast_result
+
+        # Send email
+        subject = f"Your Running Forecast for {city}"
+        email_body = create_email_html(forecast_result['final_html'], city)
+        
+        success = send_email_notification(email, subject, email_body, is_html=True)
+        
+        if success:
+            return {
+                'final_html': f'<div style="color: green; font-weight: bold;">✅ Email sent successfully to {email}!</div>' + forecast_result['final_html'],
+                'final_user_message': f'Forecast emailed to {email} successfully.'
+            }
+        else:
+            return {
+                'final_html': f'<div style="color: red;">❌ Failed to send email to {email}.</div>' + forecast_result['final_html'],
+                'final_user_message': f'Failed to send email to {email}.'
+            }
+
+    except Exception as e:
+        logger.error(f"Error in email request: {e}")
+        return {
+            'final_html': f'<div style="color: red;">Error sending email: {str(e)}</div>',
+            'final_user_message': f'Error sending email: {str(e)}'
+        }
+
+def handle_schedule_request(city: str, time_windows: dict, form_data: dict, email: str) -> dict:
+    """Handle schedule request."""
+    if not email:
+        return {
+            'final_html': '<div style="color: red;">Error: Email address is required for scheduling.</div>',
+            'final_user_message': 'Please provide an email address for scheduling.'
+        }
+
+    try:
+        scheduled_time = form_data.get('schedule_time', ['06:00'])[0]
+        start_date = form_data.get('schedule_start_date', [''])[0]
+        end_date = form_data.get('schedule_end_date', [''])[0]
+
+        if not start_date or not end_date:
+            return {
+                'final_html': '<div style="color: red;">Error: Start and end dates are required for scheduling.</div>',
+                'final_user_message': 'Please provide start and end dates for scheduling.'
+            }
+
+        # Schedule the job
+        result_message = schedule_daily_email_report(
+    location=city,
+    time_windows=time_windows,
+    recipient_email=email,
+    scheduled_time=scheduled_time,
+    start_date=start_date,
+    end_date=end_date
+)
+
+        return {
+            'final_html': f'<div style="color: green; font-weight: bold;">{result_message}</div>',
+            'final_user_message': result_message
+        }
+
+    except Exception as e:
+        logger.error(f"Error in schedule request: {e}")
+        return {
+            'final_html': f'<div style="color: red;">Error scheduling email: {str(e)}</div>',
+            'final_user_message': f'Error scheduling email: {str(e)}'
+        }
+
+# --- Scheduler Functions ---
+
+def run_scheduler():
+    """Run the email scheduler in a separate thread."""
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+
+def start_scheduler():
+    """Start the email scheduler in background."""
+    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
+    logger.info("Email scheduler started")

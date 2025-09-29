@@ -1,0 +1,14 @@
+=== API CALL LOG ===
+City: Edison, NJ
+API Type: hourly
+Timestamp: 2025-09-24 18:51:06
+Current Hour: 18
+===================
+
+FORMATTED OUTPUT:
+
+
+=== RAW PERIODS COUNT ===
+Total periods received: 156
+First period: {'number': 1, 'name': '', 'startTime': '2025-09-24T18:00:00-04:00', 'endTime': '2025-09-24T19:00:00-04:00', 'isDaytime': False, 'temperature': 77, 'temperatureUnit': 'F', 'temperatureTrend': '', 'probabilityOfPrecipitation': {'unitCode': 'wmoUnit:percent', 'value': 16}, 'dewpoint': {'unitCode': 'wmoUnit:degC', 'value': 20}, 'relativeHumidity': {'unitCode': 'wmoUnit:percent', 'value': 74}, 'windSpeed': '5 mph', 'windDirection': 'SE', 'icon': 'https://api.weather.gov/icons/land/night/tsra,20?size=small', 'shortForecast': 'Slight Chance Showers And Thunderstorms', 'detailedForecast': ''}
+Last period: {'number': 156, 'name': '', 'startTime': '2025-10-01T05:00:00-04:00', 'endTime': '2025-10-01T06:00:00-04:00', 'isDaytime': False, 'temperature': 56, 'temperatureUnit': 'F', 'temperatureTrend': '', 'probabilityOfPrecipitation': {'unitCode': 'wmoUnit:percent', 'value': 7}, 'dewpoint': {'unitCode': 'wmoUnit:degC', 'value': 8.88888888888889}, 'relativeHumidity': {'unitCode': 'wmoUnit:percent', 'value': 74}, 'windSpeed': '5 mph', 'windDirection': 'NE', 'icon': 'https://api.weather.gov/icons/land/night/sct?size=small', 'shortForecast': 'Partly Cloudy', 'detailedForecast': ''}

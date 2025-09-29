@@ -1,0 +1,14 @@
+=== API CALL LOG ===
+City: Las Vegas, NV
+API Type: hourly
+Timestamp: 2025-09-29 09:16:26
+Current Hour: 9
+===================
+
+FORMATTED OUTPUT:
+
+
+=== RAW PERIODS COUNT ===
+Total periods received: 156
+First period: {'number': 1, 'name': '', 'startTime': '2025-09-29T06:00:00-07:00', 'endTime': '2025-09-29T07:00:00-07:00', 'isDaytime': True, 'temperature': 70, 'temperatureUnit': 'F', 'temperatureTrend': '', 'probabilityOfPrecipitation': {'unitCode': 'wmoUnit:percent', 'value': 1}, 'dewpoint': {'unitCode': 'wmoUnit:degC', 'value': 13.333333333333334}, 'relativeHumidity': {'unitCode': 'wmoUnit:percent', 'value': 61}, 'windSpeed': '2 mph', 'windDirection': 'NNW', 'icon': 'https://api.weather.gov/icons/land/day/few?size=small', 'shortForecast': 'Sunny', 'detailedForecast': ''}
+Last period: {'number': 156, 'name': '', 'startTime': '2025-10-05T17:00:00-07:00', 'endTime': '2025-10-05T18:00:00-07:00', 'isDaytime': True, 'temperature': 85, 'temperatureUnit': 'F', 'temperatureTrend': '', 'probabilityOfPrecipitation': {'unitCode': 'wmoUnit:percent', 'value': 0}, 'dewpoint': {'unitCode': 'wmoUnit:degC', 'value': -1.6666666666666667}, 'relativeHumidity': {'unitCode': 'wmoUnit:percent', 'value': 13}, 'windSpeed': '10 mph', 'windDirection': 'S', 'icon': 'https://api.weather.gov/icons/land/day/skc?size=small', 'shortForecast': 'Sunny', 'detailedForecast': ''}

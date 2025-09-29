@@ -1,0 +1,14 @@
+=== API CALL LOG ===
+City: Phoenix,AZ
+API Type: hourly
+Timestamp: 2025-09-27 20:13:05
+Current Hour: 20
+===================
+
+FORMATTED OUTPUT:
+
+
+=== RAW PERIODS COUNT ===
+Total periods received: 156
+First period: {'number': 1, 'name': '', 'startTime': '2025-09-27T16:00:00-07:00', 'endTime': '2025-09-27T17:00:00-07:00', 'isDaytime': True, 'temperature': 88, 'temperatureUnit': 'F', 'temperatureTrend': '', 'probabilityOfPrecipitation': {'unitCode': 'wmoUnit:percent', 'value': 28}, 'dewpoint': {'unitCode': 'wmoUnit:degC', 'value': 15}, 'relativeHumidity': {'unitCode': 'wmoUnit:percent', 'value': 38}, 'windSpeed': '5 mph', 'windDirection': 'ENE', 'icon': 'https://api.weather.gov/icons/land/day/tsra_hi,30?size=small', 'shortForecast': 'Chance Showers And Thunderstorms', 'detailedForecast': ''}
+Last period: {'number': 156, 'name': '', 'startTime': '2025-10-04T03:00:00-07:00', 'endTime': '2025-10-04T04:00:00-07:00', 'isDaytime': False, 'temperature': 76, 'temperatureUnit': 'F', 'temperatureTrend': '', 'probabilityOfPrecipitation': {'unitCode': 'wmoUnit:percent', 'value': 2}, 'dewpoint': {'unitCode': 'wmoUnit:degC', 'value': 10.555555555555555}, 'relativeHumidity': {'unitCode': 'wmoUnit:percent', 'value': 42}, 'windSpeed': '0 mph', 'windDirection': '', 'icon': 'https://api.weather.gov/icons/land/night/skc?size=small', 'shortForecast': 'Clear', 'detailedForecast': ''}

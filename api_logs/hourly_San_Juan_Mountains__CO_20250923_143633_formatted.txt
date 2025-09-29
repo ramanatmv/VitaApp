@@ -1,0 +1,14 @@
+=== API CALL LOG ===
+City: San Juan Mountains, CO
+API Type: hourly
+Timestamp: 2025-09-23 14:36:33
+Current Hour: 14
+===================
+
+FORMATTED OUTPUT:
+
+
+=== RAW PERIODS COUNT ===
+Total periods received: 156
+First period: {'number': 1, 'name': '', 'startTime': '2025-09-23T12:00:00-06:00', 'endTime': '2025-09-23T13:00:00-06:00', 'isDaytime': True, 'temperature': 40, 'temperatureUnit': 'F', 'temperatureTrend': '', 'probabilityOfPrecipitation': {'unitCode': 'wmoUnit:percent', 'value': 2}, 'dewpoint': {'unitCode': 'wmoUnit:degC', 'value': -3.888888888888889}, 'relativeHumidity': {'unitCode': 'wmoUnit:percent', 'value': 55}, 'windSpeed': '10 mph', 'windDirection': 'WNW', 'icon': 'https://api.weather.gov/icons/land/day/few?size=small', 'shortForecast': 'Sunny', 'detailedForecast': ''}
+Last period: {'number': 156, 'name': '', 'startTime': '2025-09-29T23:00:00-06:00', 'endTime': '2025-09-30T00:00:00-06:00', 'isDaytime': False, 'temperature': 43, 'temperatureUnit': 'F', 'temperatureTrend': '', 'probabilityOfPrecipitation': {'unitCode': 'wmoUnit:percent', 'value': 14}, 'dewpoint': {'unitCode': 'wmoUnit:degC', 'value': 2.7777777777777777}, 'relativeHumidity': {'unitCode': 'wmoUnit:percent', 'value': 79}, 'windSpeed': '5 mph', 'windDirection': 'SE', 'icon': 'https://api.weather.gov/icons/land/night/tsra_hi?size=small', 'shortForecast': 'Slight Chance Showers And Thunderstorms', 'detailedForecast': ''}

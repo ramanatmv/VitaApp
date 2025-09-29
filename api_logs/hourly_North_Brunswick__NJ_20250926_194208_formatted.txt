@@ -1,0 +1,14 @@
+=== API CALL LOG ===
+City: North Brunswick, NJ
+API Type: hourly
+Timestamp: 2025-09-26 19:42:08
+Current Hour: 19
+===================
+
+FORMATTED OUTPUT:
+
+
+=== RAW PERIODS COUNT ===
+Total periods received: 156
+First period: {'number': 1, 'name': '', 'startTime': '2025-09-26T18:00:00-04:00', 'endTime': '2025-09-26T19:00:00-04:00', 'isDaytime': False, 'temperature': 78, 'temperatureUnit': 'F', 'temperatureTrend': '', 'probabilityOfPrecipitation': {'unitCode': 'wmoUnit:percent', 'value': 0}, 'dewpoint': {'unitCode': 'wmoUnit:degC', 'value': 16.666666666666668}, 'relativeHumidity': {'unitCode': 'wmoUnit:percent', 'value': 58}, 'windSpeed': '0 mph', 'windDirection': '', 'icon': 'https://api.weather.gov/icons/land/night/skc?size=small', 'shortForecast': 'Clear', 'detailedForecast': ''}
+Last period: {'number': 156, 'name': '', 'startTime': '2025-10-03T05:00:00-04:00', 'endTime': '2025-10-03T06:00:00-04:00', 'isDaytime': False, 'temperature': 46, 'temperatureUnit': 'F', 'temperatureTrend': '', 'probabilityOfPrecipitation': {'unitCode': 'wmoUnit:percent', 'value': 3}, 'dewpoint': {'unitCode': 'wmoUnit:degC', 'value': 4.444444444444445}, 'relativeHumidity': {'unitCode': 'wmoUnit:percent', 'value': 79}, 'windSpeed': '5 mph', 'windDirection': 'N', 'icon': 'https://api.weather.gov/icons/land/night/sct?size=small', 'shortForecast': 'Partly Cloudy', 'detailedForecast': ''}

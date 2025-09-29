@@ -1,0 +1,14 @@
+=== API CALL LOG ===
+City: Jamesburg, NJ
+API Type: hourly
+Timestamp: 2025-09-24 16:12:29
+Current Hour: 16
+===================
+
+FORMATTED OUTPUT:
+
+
+=== RAW PERIODS COUNT ===
+Total periods received: 156
+First period: {'number': 1, 'name': '', 'startTime': '2025-09-24T07:00:00-04:00', 'endTime': '2025-09-24T08:00:00-04:00', 'isDaytime': True, 'temperature': 64, 'temperatureUnit': 'F', 'temperatureTrend': '', 'probabilityOfPrecipitation': {'unitCode': 'wmoUnit:percent', 'value': 1}, 'dewpoint': {'unitCode': 'wmoUnit:degC', 'value': 17.77777777777778}, 'relativeHumidity': {'unitCode': 'wmoUnit:percent', 'value': 100}, 'windSpeed': '0 mph', 'windDirection': '', 'icon': 'https://api.weather.gov/icons/land/day/fog?size=small', 'shortForecast': 'Patchy Fog', 'detailedForecast': ''}
+Last period: {'number': 156, 'name': '', 'startTime': '2025-09-30T18:00:00-04:00', 'endTime': '2025-09-30T19:00:00-04:00', 'isDaytime': False, 'temperature': 71, 'temperatureUnit': 'F', 'temperatureTrend': '', 'probabilityOfPrecipitation': {'unitCode': 'wmoUnit:percent', 'value': 17}, 'dewpoint': {'unitCode': 'wmoUnit:degC', 'value': 14.444444444444445}, 'relativeHumidity': {'unitCode': 'wmoUnit:percent', 'value': 63}, 'windSpeed': '5 mph', 'windDirection': 'NE', 'icon': 'https://api.weather.gov/icons/land/night/rain_showers,20?size=small', 'shortForecast': 'Slight Chance Rain Showers', 'detailedForecast': ''}
